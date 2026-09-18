@@ -1,0 +1,9 @@
+/data/
+/bin/
+.env
+*.pem
+*_ed25519*
+coverage.out
+deploy/terraform/.terraform/
+*.tfstate*
+*.tfvars
