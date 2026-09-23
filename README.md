@@ -7,8 +7,9 @@ server receives the push, builds an image, starts the container, routes traffic 
 hostname, and swaps releases without dropping requests. One Go binary, SQLite for state,
 Docker underneath, and later my own container runtime as a second backend.
 
-Work in progress. Today the daemon loads its configuration, logs that it is ready, and shuts
-down cleanly on SIGINT or SIGTERM. The git server, builder, and router come next.
+Work in progress. Today the daemon loads its configuration, opens its SQLite database and
+brings the schema up to date, logs that it is ready, and shuts down cleanly on SIGINT or
+SIGTERM. The git server, builder, and router come next.
 
 ## Build and run
 

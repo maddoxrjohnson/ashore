@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/maddoxrjohnson/ashore/internal/config"
+	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
 var version = "dev"
@@ -38,10 +40,19 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("data dir: %w", err)
+	}
+	st, err := store.Open(ctx, filepath.Join(cfg.DataDir, "ashore.db"))
+	if err != nil {
+		return err
+	}
+
 	slog.Info("ready", "version", version)
 	<-ctx.Done()
 	slog.Info("shutting down")
-	return nil
+	return st.Close()
 }
 
 // newLogger builds the daemon's logger: JSON for machines, text for a
