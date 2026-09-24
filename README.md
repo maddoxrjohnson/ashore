@@ -8,8 +8,11 @@ hostname, and swaps releases without dropping requests. One Go binary, SQLite fo
 Docker underneath, and later my own container runtime as a second backend.
 
 Work in progress. Today the daemon loads its configuration, opens its SQLite database and
-brings the schema up to date, logs that it is ready, and shuts down cleanly on SIGINT or
-SIGTERM. The git server, builder, and router come next.
+brings the schema up to date, and accepts `git push` over SSH: it authenticates with public
+keys from its own key table, keeps one bare repository per app, and runs nothing except
+`git receive-pack` and `git upload-pack`. Shells, terminals, subsystems, and port forwarding
+are refused. It shuts down cleanly on SIGINT or SIGTERM, ending any push in progress. The
+deploy hook, builder, and router come next.
 
 ## Build and run
 

@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
 	"github.com/maddoxrjohnson/ashore/internal/config"
+	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
@@ -49,10 +51,32 @@ func run() error {
 		return err
 	}
 
+	gs, err := gitserver.New(st, cfg.DataDir, cfg.SSHHostKey)
+	if err != nil {
+		_ = st.Close()
+		return err
+	}
+	ln, err := net.Listen("tcp", cfg.SSHAddr)
+	if err != nil {
+		_ = st.Close()
+		return fmt.Errorf("ssh listen: %w", err)
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- gs.Serve(ctx, ln) }()
+	slog.Info("ssh listening", "addr", ln.Addr().String())
 	slog.Info("ready", "version", version)
-	<-ctx.Done()
-	slog.Info("shutting down")
-	return st.Close()
+
+	var serveErr error
+	select {
+	case <-ctx.Done():
+		slog.Info("shutting down")
+		serveErr = <-errc // Serve closes the listener and waits for its connections
+	case serveErr = <-errc:
+	}
+	if err := st.Close(); err != nil {
+		return err
+	}
+	return serveErr
 }
 
 // newLogger builds the daemon's logger: JSON for machines, text for a
