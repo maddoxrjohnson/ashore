@@ -21,7 +21,7 @@ func RepoPath(dataDir, app string) string {
 }
 
 // HooksPath is the directory git runs hooks from for every app repository.
-// The daemon writes its pre-receive hook there (Phase 1.2).
+// The daemon writes its pre-receive hook there at start.
 func HooksPath(dataDir string) string {
 	return filepath.Join(dataDir, "hooks")
 }

@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,11 +24,39 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
+// fakeHooks records the nonces the server asks for. Socket is a fixed
+// string; nothing listens on it.
+type fakeHooks struct {
+	mu      sync.Mutex
+	issued  []string // app per Issue call
+	revoked int
+}
+
+func (f *fakeHooks) Socket() string { return "/run/fake/ashore.sock" }
+
+func (f *fakeHooks) Issue(app string) (string, func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issued = append(f.issued, app)
+	return "nonce-" + strconv.Itoa(len(f.issued)), func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.revoked++
+	}
+}
+
+func (f *fakeHooks) counts() (issued, revoked int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.issued), f.revoked
+}
+
 // testServer is a gitserver without the daemon around it, with one
 // authorized client key.
 type testServer struct {
 	srv     *Server
 	st      *store.Store
+	hooks   *fakeHooks
 	dataDir string
 	ln      net.Listener
 	addr    string
@@ -44,7 +74,8 @@ func newTestServer(t *testing.T) (*testServer, context.Context, context.CancelFu
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	srv, err := New(st, dataDir, filepath.Join(dataDir, "host_ed25519"))
+	hooks := &fakeHooks{}
+	srv, err := New(st, hooks, dataDir, filepath.Join(dataDir, "host_ed25519"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +103,7 @@ func newTestServer(t *testing.T) (*testServer, context.Context, context.CancelFu
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(block), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &testServer{srv: srv, st: st, dataDir: dataDir, signer: signer, keyFile: keyFile}, ctx, cancel
+	return &testServer{srv: srv, st: st, hooks: hooks, dataDir: dataDir, signer: signer, keyFile: keyFile}, ctx, cancel
 }
 
 // startServer serves on a random loopback port until the test ends.
@@ -260,10 +291,15 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // startReceivePack begins a push over the x/crypto client and returns once
-// git's ref advertisement has arrived, which proves git is running.
+// git's ref advertisement has arrived, which proves git is running. The
+// session's stdin is a pipe nobody writes to: with no stdin the client
+// library sends EOF at once, and receive-pack exits before the test looks.
 func startReceivePack(t *testing.T, client *ssh.Client, app string) {
 	t.Helper()
 	sess := newSession(t, client)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	sess.Stdin = pr
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -337,13 +373,15 @@ func TestPushWithGit(t *testing.T) {
 	requireBinaries(t, "git", "ssh")
 	ts := startServer(t)
 	repo := ts.createApp(t, "hello")
-	// A stand-in hook proves core.hooksPath points at the daemon's directory
-	// and that hook output reaches the pusher.
+	// A stand-in hook proves core.hooksPath points at the daemon's directory,
+	// that hook output reaches the pusher, and that the hook's environment
+	// carries the socket and the nonce.
 	hooks := HooksPath(ts.dataDir)
 	if err := os.MkdirAll(hooks, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(hooks, "pre-receive"), []byte("#!/bin/sh\necho stand-in hook ran\n"), 0o755); err != nil {
+	script := "#!/bin/sh\necho \"stand-in hook ran app=$ASHORE_APP sock=$ASHORE_SOCK nonce=$ASHORE_NONCE\"\n"
+	if err := os.WriteFile(filepath.Join(hooks, "pre-receive"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -358,8 +396,11 @@ func TestPushWithGit(t *testing.T) {
 	work.run("commit", "--quiet", "-m", "one")
 
 	out := work.run("push", ts.url("hello"), "main")
-	if !strings.Contains(out, "remote: stand-in hook ran") {
-		t.Fatalf("push output lacks the hook line:\n%s", out)
+	if want := "remote: stand-in hook ran app=hello sock=/run/fake/ashore.sock nonce=nonce-1"; !strings.Contains(out, want) {
+		t.Fatalf("push output lacks %q:\n%s", want, out)
+	}
+	if issued, revoked := ts.hooks.counts(); issued != 1 || revoked != 1 {
+		t.Fatalf("after one push: issued %d, revoked %d; want 1 and 1", issued, revoked)
 	}
 	if got, want := serverRef(t, repo, "refs/heads/main"), work.run("rev-parse", "HEAD"); got != want {
 		t.Fatalf("server main = %s, want %s", got, want)
@@ -380,6 +421,10 @@ func TestPushWithGit(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(clone, "README"))
 	if err != nil || string(data) != "two\n" {
 		t.Fatalf("clone README = %q, %v; want %q", data, err, "two\n")
+	}
+	// Two pushes needed two nonces; the clone (upload-pack) needed none.
+	if issued, revoked := ts.hooks.counts(); issued != 2 || revoked != 2 {
+		t.Fatalf("after two pushes and a clone: issued %d, revoked %d; want 2 and 2", issued, revoked)
 	}
 }
 

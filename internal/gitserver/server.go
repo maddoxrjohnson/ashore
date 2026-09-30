@@ -33,6 +33,14 @@ type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
 }
 
+// Hooks supplies what a receive-pack's pre-receive hook needs to reach the
+// daemon: the socket path and a nonce good for one push of one app. revoke
+// is called once git has exited, so a nonce never outlives its push.
+type Hooks interface {
+	Socket() string
+	Issue(app string) (nonce string, revoke func())
+}
+
 const (
 	// handshakeTimeout bounds a client that connects and then says nothing;
 	// x/crypto/ssh has no timeout of its own for that.
@@ -49,6 +57,7 @@ const (
 // Server serves git over SSH. Create it with New and run it with Serve.
 type Server struct {
 	store   Store
+	hooks   Hooks
 	dataDir string
 	config  *ssh.ServerConfig
 	hostKey ssh.PublicKey
@@ -63,7 +72,7 @@ type Server struct {
 // New loads or creates the host key and prepares the SSH configuration.
 // dataDir holds repos/<app>.git and is made absolute so that git and the
 // hooks never depend on the daemon's working directory.
-func New(st Store, dataDir, hostKeyPath string) (*Server, error) {
+func New(st Store, hooks Hooks, dataDir, hostKeyPath string) (*Server, error) {
 	abs, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
@@ -74,6 +83,7 @@ func New(st Store, dataDir, hostKeyPath string) (*Server, error) {
 	}
 	s := &Server{
 		store:       st,
+		hooks:       hooks,
 		dataDir:     abs,
 		hostKey:     signer.PublicKey(),
 		Fingerprint: ssh.FingerprintSHA256(signer.PublicKey()),
@@ -244,8 +254,14 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 	}
 	slog.Info("git", "service", service, "app", app, "fingerprint", fp)
 
+	env := []string{"ASHORE_APP=" + app}
+	if service == "receive-pack" { // only a push runs the hook
+		nonce, revoke := s.hooks.Issue(app)
+		defer revoke()
+		env = append(env, "ASHORE_SOCK="+s.hooks.Socket(), "ASHORE_NONCE="+nonce)
+	}
 	cmd := exec.CommandContext(ctx, "git", service, repo)
-	cmd.Env = gitEnv("ASHORE_APP=" + app)
+	cmd.Env = gitEnv(env...)
 	cmd.Stdout = ch
 	cmd.Stderr = ch.Stderr()
 	// SIGTERM first so git removes its quarantine directory; Go sends SIGKILL
@@ -279,7 +295,7 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 }
 
 // gitEnv is the child's entire environment: nothing the client sent, only
-// what git needs from the daemon. Phase 1.2 adds the hook's variables.
+// what git needs from the daemon.
 func gitEnv(extra ...string) []string {
 	env := []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C"}
 	if home := os.Getenv("HOME"); home != "" {
