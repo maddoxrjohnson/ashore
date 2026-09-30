@@ -11,8 +11,13 @@ Work in progress. Today the daemon loads its configuration, opens its SQLite dat
 brings the schema up to date, and accepts `git push` over SSH: it authenticates with public
 keys from its own key table, keeps one bare repository per app, and runs nothing except
 `git receive-pack` and `git upload-pack`. Shells, terminals, subsystems, and port forwarding
-are refused. It shuts down cleanly on SIGINT or SIGTERM, ending any push in progress. The
-deploy hook, builder, and router come next.
+are refused. A pre-receive hook hands each push to the daemon over a unix socket, proving it
+belongs to that push with a one-time nonce, and the daemon streams its answer back to the
+pusher's terminal. The builder turns a pushed commit into an image through the Docker Engine
+API and keeps a build log per commit; `examples/hello-go` is the first app it builds. Until
+the supervisor exists every push is acknowledged and then rejected, so no repository holds a
+commit that never deployed. It shuts down cleanly on SIGINT or SIGTERM, ending any push in
+progress. The container runtime, the router, and the supervisor come next.
 
 ## Build and run
 
