@@ -14,10 +14,13 @@ keys from its own key table, keeps one bare repository per app, and runs nothing
 are refused. A pre-receive hook hands each push to the daemon over a unix socket, proving it
 belongs to that push with a one-time nonce, and the daemon streams its answer back to the
 pusher's terminal. The builder turns a pushed commit into an image through the Docker Engine
-API and keeps a build log per commit; `examples/hello-go` is the first app it builds. Until
-the supervisor exists every push is acknowledged and then rejected, so no repository holds a
+API and keeps a build log per commit; `examples/hello-go` is the first app it builds. The
+Docker runtime starts an image as a container published on 127.0.0.1 only, with memory, CPU,
+and process limits and `no-new-privileges`, and can stop it, wait for it, follow its stdout
+and stderr separately, and find every container it created after a restart. Until the
+supervisor exists every push is acknowledged and then rejected, so no repository holds a
 commit that never deployed. It shuts down cleanly on SIGINT or SIGTERM, ending any push in
-progress. The container runtime, the router, and the supervisor come next.
+progress. The router and the supervisor come next.
 
 ## Build and run
 
