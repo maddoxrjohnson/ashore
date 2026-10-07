@@ -82,6 +82,19 @@ func ValidateName(name string) error {
 // isUnique reports whether err is a UNIQUE constraint violation, which is how
 // SQLite tells us a name or fingerprint is already taken.
 func isUnique(err error) bool {
+	return constraintCode(err) == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+}
+
+// isForeignKey reports a FOREIGN KEY violation: a row that points at an app
+// or release that does not exist.
+func isForeignKey(err error) bool {
+	return constraintCode(err) == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+}
+
+func constraintCode(err error) int {
 	var se *sqlite.Error
-	return errors.As(err, &se) && se.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+	if errors.As(err, &se) {
+		return se.Code()
+	}
+	return 0
 }

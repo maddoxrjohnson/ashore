@@ -15,6 +15,9 @@ type App struct {
 	Name      string
 	Host      string
 	CreatedAt time.Time
+	// LiveReleaseID is the release the router serves, 0 before the first
+	// deploy. SetLive maintains it.
+	LiveReleaseID int64
 }
 
 // scanner is what *sql.Row and *sql.Rows have in common, so one scan function
@@ -23,12 +26,12 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-const appColumns = `id, name, host, created_at`
+const appColumns = `id, name, host, created_at, COALESCE(live_release_id, 0)`
 
 func scanApp(sc scanner) (App, error) {
 	var a App
 	var created int64
-	if err := sc.Scan(&a.ID, &a.Name, &a.Host, &created); err != nil {
+	if err := sc.Scan(&a.ID, &a.Name, &a.Host, &created, &a.LiveReleaseID); err != nil {
 		return App{}, err
 	}
 	a.CreatedAt = time.Unix(created, 0).UTC()
