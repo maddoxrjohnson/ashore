@@ -239,7 +239,7 @@ func TestDeployHappyPath(t *testing.T) {
 		t.Fatalf("deploy: %v\n%s", err, out)
 	}
 	for _, want := range []string{
-		"-----> building hello (abc1234)\n", "Step 1/1", "-----> release v1\n",
+		"-----> release v1 (abc1234)\n", "-----> building hello\n", "Step 1/1",
 		"-----> waiting for v1 to listen on port 8080\n", "-----> live at http://hello.localhost:8080\n",
 	} {
 		if !strings.Contains(out, want) {
@@ -262,7 +262,7 @@ func TestDeployHappyPath(t *testing.T) {
 	}
 	app, _ := f.store.GetApp(context.Background(), "hello")
 	rel, err := f.store.LiveRelease(context.Background(), app.ID)
-	if err != nil || rel.Version != 1 || rel.Status != store.StatusLive || rel.GitSHA != sha || rel.Note != "push abc1234" {
+	if err != nil || rel.Version != 1 || rel.Status != store.StatusLive || rel.GitSHA != sha || rel.Note != "push abc1234" || rel.Image != "ashore/hello:abc1234" {
 		t.Errorf("live release = %+v, %v", rel, err)
 	}
 	if len(f.runtime.stoppedIDs()) != 0 {
@@ -307,9 +307,35 @@ func TestBuildFailureRejects(t *testing.T) {
 	if len(f.runtime.started) != 0 {
 		t.Error("an instance was started after a failed build")
 	}
+	// The attempt is history: v1 is used up and says why it never ran.
 	app, _ := f.store.GetApp(context.Background(), "hello")
-	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 0 {
-		t.Errorf("releases after a failed build: %+v", rels)
+	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 1 || rels[0].Status != store.StatusFailed || rels[0].Image != "" {
+		t.Errorf("releases after a failed build: %+v, want one failed without an image", rels)
+	}
+}
+
+func TestReleaseIsBuildingDuringBuild(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.builder.block = make(chan struct{})
+	f.builder.started = make(chan string, 1)
+	errs := make(chan error, 1)
+	go func() {
+		_, err := f.deploy(context.Background(), "hello")
+		errs <- err
+	}()
+	<-f.builder.started
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	rels, _ := f.store.ListReleases(context.Background(), app.ID)
+	if len(rels) != 1 || rels[0].Status != store.StatusBuilding || rels[0].Image != "" || rels[0].Note != "push abc1234" {
+		t.Errorf("releases during the build = %+v, want one building", rels)
+	}
+	close(f.builder.block)
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	rels, _ = f.store.ListReleases(context.Background(), app.ID)
+	if len(rels) != 1 || rels[0].Status != store.StatusLive || rels[0].Image != "ashore/hello:abc1234" {
+		t.Errorf("releases after the build = %+v, want the same row live with its image", rels)
 	}
 }
 
@@ -494,8 +520,8 @@ func TestCancelledPushIsRejected(t *testing.T) {
 		t.Fatalf("deploy after a cancelled one: %v", err)
 	}
 	app, _ := f.store.GetApp(context.Background(), "hello")
-	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 1 {
-		t.Errorf("releases = %+v, want only the successful one", rels)
+	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 2 || rels[0].Status != store.StatusFailed || rels[1].Status != store.StatusLive {
+		t.Errorf("releases = %+v, want the cancelled one failed and the second live", rels)
 	}
 }
 

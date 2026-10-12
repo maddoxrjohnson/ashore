@@ -32,8 +32,9 @@ import (
 // Store is the slice of the database the supervisor uses.
 type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
-	CreateRelease(ctx context.Context, appID int64, image, gitSHA, note string) (store.Release, error)
-	SetReleaseStatus(ctx context.Context, id int64, status string) error
+	CreateRelease(ctx context.Context, appID int64, n store.NewRelease) (store.Release, error)
+	MarkBuilt(ctx context.Context, id int64, image string) error
+	MarkFailed(ctx context.Context, id int64) error
 	SetLive(ctx context.Context, appID, releaseID int64) error
 }
 
@@ -225,28 +226,36 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		return err
 	}
 
-	// Build, under the global cap.
-	if err := s.acquireBuild(ctx, out); err != nil {
+	// The release row comes first, in status building, so the version is
+	// fixed and announced before any work starts. From here on every
+	// failure must end the row (failed), with a context that still works
+	// after the pusher's has been cancelled.
+	rel, err := s.store.CreateRelease(ctx, app.ID, store.NewRelease{GitSHA: cmd.sha, Note: "push " + short})
+	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(out, "-----> building %s (%s)\n", a.name, short)
+	_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), short)
+
+	// Build, under the global cap.
+	if err := s.acquireBuild(ctx, out); err != nil {
+		a.fail(ctx, rel)
+		return err
+	}
+	_, _ = fmt.Fprintf(out, "-----> building %s\n", a.name)
 	image, err := s.builder.Build(ctx, builder.Job{
 		App: a.name, Repo: gitserver.RepoPath(s.cfg.DataDir, a.name), SHA: cmd.sha, Quarantine: cmd.quarantine,
 	}, out)
 	<-s.builds
+	if err == nil {
+		err = s.store.MarkBuilt(ctx, rel.ID, image)
+	}
 	if err != nil {
+		a.fail(ctx, rel)
 		return err
 	}
+	rel.Image, rel.Status = image, store.StatusStarting // what MarkBuilt wrote; start needs the image
 
-	rel, err := s.store.CreateRelease(ctx, app.ID, image, cmd.sha, "push "+short)
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(out, "-----> release %s\n", rel.Name())
-
-	// Start and wait until it answers. From here on a failure must also
-	// mark the release and remove the instance, with a context that still
-	// works after the pusher's has been cancelled.
+	// Start and wait until it answers.
 	inst, err := a.start(ctx, rel, out)
 	if err == nil && ctx.Err() != nil {
 		// The pusher is gone, so git will not record this commit. Going
@@ -257,7 +266,7 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		}
 	}
 	if err != nil {
-		_ = s.store.SetReleaseStatus(context.WithoutCancel(ctx), rel.ID, store.StatusFailed)
+		a.fail(ctx, rel)
 		return err
 	}
 
@@ -279,6 +288,14 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		s.log.Error("mark release live", "app", a.name, "release", rel.Name(), "err", err)
 	}
 	return nil
+}
+
+// fail ends a release that will not go live. It uses a context that
+// survives the pusher's cancellation, since that is one of the reasons.
+func (a *actor) fail(ctx context.Context, rel store.Release) {
+	if err := a.sup.store.MarkFailed(context.WithoutCancel(ctx), rel.ID); err != nil {
+		a.sup.log.Error("mark release failed", "app", a.name, "release", rel.Name(), "err", err)
+	}
 }
 
 // acquireBuild takes a build slot, telling the pusher when it has to wait.

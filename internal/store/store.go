@@ -13,9 +13,10 @@ import (
 )
 
 var (
-	ErrNotFound    = errors.New("not found")
-	ErrExists      = errors.New("already exists")
-	ErrInvalidName = errors.New("invalid app name")
+	ErrNotFound          = errors.New("not found")
+	ErrExists            = errors.New("already exists")
+	ErrInvalidName       = errors.New("invalid app name")
+	ErrInvalidTransition = errors.New("invalid release status transition")
 )
 
 // nameRE is the whole rule for app names. A name is a database key, a label in

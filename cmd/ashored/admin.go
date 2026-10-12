@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -22,8 +24,10 @@ import (
 // an app can be created and a key registered before the HTTP API and the
 // ashore CLI exist; those will replace them.
 const adminUsage = `usage:
-  ashored apps create <name>          create an app and its repository
-  ashored keys add <name> <pubkey>    allow a public key file to push`
+  ashored apps create <name>            create an app and its repository
+  ashored keys add <name> <pubkey>      allow a public key file to push
+  ashored releases list <app>           list an app's releases, newest first
+  ashored releases info <app> <vN>      show one release`
 
 var errUsage = errors.New(adminUsage)
 
@@ -51,6 +55,16 @@ func admin(ctx context.Context, cfg config.Config, args []string, out io.Writer)
 			return errUsage
 		}
 		return addKey(ctx, st, args[2], args[3], out)
+	case "releases list":
+		if len(args) != 3 {
+			return errUsage
+		}
+		return listReleases(ctx, st, args[2], out)
+	case "releases info":
+		if len(args) != 4 {
+			return errUsage
+		}
+		return releaseInfo(ctx, st, args[2], args[3], out)
 	}
 	return errUsage
 }
@@ -104,4 +118,55 @@ func addKey(ctx context.Context, st *store.Store, name, path string, out io.Writ
 	}
 	_, _ = fmt.Fprintf(out, "added key %s (%s)\n", name, fp)
 	return nil
+}
+
+// listReleases prints one line per release, newest first, the way a deploy
+// history is read.
+func listReleases(ctx context.Context, st *store.Store, name string, out io.Writer) error {
+	app, err := st.GetApp(ctx, name)
+	if err != nil {
+		return err
+	}
+	rels, err := st.ListReleases(ctx, app.ID)
+	if err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "VERSION\tSTATUS\tCREATED\tNOTE")
+	for i := len(rels) - 1; i >= 0; i-- {
+		r := rels[i]
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.Name(), r.Status, r.CreatedAt.Local().Format(time.DateTime), r.Note)
+	}
+	return tw.Flush()
+}
+
+// releaseInfo prints everything recorded about one release. The config
+// snapshot is shown as stored; it is empty until config vars exist.
+func releaseInfo(ctx context.Context, st *store.Store, name, version string, out io.Writer) error {
+	app, err := st.GetApp(ctx, name)
+	if err != nil {
+		return err
+	}
+	v, err := store.ParseVersion(version)
+	if err != nil {
+		return err
+	}
+	r, err := st.ReleaseByVersion(ctx, app.ID, v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 1, ' ', 0)
+	for _, kv := range [][2]string{
+		{"release", r.Name()},
+		{"app", app.Name},
+		{"status", r.Status},
+		{"image", r.Image},
+		{"commit", r.GitSHA},
+		{"created", r.CreatedAt.Local().Format(time.DateTime)},
+		{"note", r.Note},
+		{"config", r.ConfigJSON},
+	} {
+		_, _ = fmt.Fprintf(tw, "%s:\t%s\n", kv[0], kv[1])
+	}
+	return tw.Flush()
 }

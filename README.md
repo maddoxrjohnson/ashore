@@ -33,16 +33,18 @@ With Docker running and the daemon started (`make run`, text logs on stderr):
     git push ashore main
     curl http://hello.localhost:8080/
 
-The push prints the build steps, `release v1`, and `live at http://hello.localhost:8080`.
+The push prints `release v1`, the build steps, and `live at http://hello.localhost:8080`.
 Change the string in `main.go`, commit, push again, and curl shows the new one. Break the
 `Dockerfile`, push, and the push is rejected while the old version keeps serving.
+`./bin/ashored releases list hello` shows the history, the rejected push included as a
+`failed` release; `releases info hello v2` shows one release's image, commit, and config.
 
 The build context is `git archive` of the pushed commit, so only tracked files reach the
 build and `.dockerignore` has no effect. To keep tracked files out of the image, mark them
 `export-ignore` in `.gitattributes`.
 
-The admin subcommands (`apps create`, `keys add`) are a stopgap until the HTTP API and the
-`ashore` CLI exist. A daemon restart does not yet re-attach the containers it started;
+The admin subcommands (`apps create`, `keys add`, `releases list`, `releases info`) are a
+stopgap until the HTTP API and the `ashore` CLI exist. A daemon restart does not yet re-attach the containers it started;
 until reconciliation lands, `docker ps --filter label=ashore.app` shows what is running.
 
 ## Build and run

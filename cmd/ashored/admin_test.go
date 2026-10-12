@@ -53,6 +53,10 @@ func TestAdmin(t *testing.T) {
 		{"add key", []string{"keys", "add", "me", keyFile}, "added key me (" + ssh.FingerprintSHA256(sshPub) + ")", nil},
 		{"add key again", []string{"keys", "add", "me", keyFile}, "", store.ErrExists},
 		{"missing key file", []string{"keys", "add", "me", keyFile + ".nope"}, "", os.ErrNotExist},
+		{"list no releases", []string{"releases", "list", "hello"}, "VERSION", nil},
+		{"list unknown app", []string{"releases", "list", "nope"}, "", store.ErrNotFound},
+		{"info no release", []string{"releases", "info", "hello", "v1"}, "", store.ErrNotFound},
+		{"info bad args", []string{"releases", "info", "hello"}, "", errUsage},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -85,6 +89,46 @@ func TestAdmin(t *testing.T) {
 	}
 	if strings.Contains(k.PubKey, "me@laptop") {
 		t.Errorf("stored key kept the comment: %q", k.PubKey)
+	}
+
+	// With a deploy history: a failed v1 and a live v2, listed newest first.
+	app, err := st.GetApp(ctx, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := st.CreateRelease(ctx, app.ID, store.NewRelease{GitSHA: "1111111111111111111111111111111111111111", Note: "push 1111111"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkFailed(ctx, r1.ID); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := st.CreateRelease(ctx, app.ID, store.NewRelease{Image: "ashore/hello:2222222", GitSHA: "2222222222222222222222222222222222222222", Note: "push 2222222"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetLive(ctx, app.ID, r2.ID); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := admin(ctx, cfg, []string{"releases", "list", "hello"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[1], "v2 ") || !strings.Contains(lines[1], "live") || !strings.HasPrefix(lines[2], "v1 ") || !strings.Contains(lines[2], "failed") {
+		t.Errorf("releases list:\n%s", out.String())
+	}
+	out.Reset()
+	if err := admin(ctx, cfg, []string{"releases", "info", "hello", "v2"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"release: v2", "status:  live", "image:   ashore/hello:2222222", "commit:  2222222222222222222222222222222222222222", "note:    push 2222222", "config:  {}"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("releases info lacks %q:\n%s", want, out.String())
+		}
+	}
+	if err := admin(ctx, cfg, []string{"releases", "info", "hello", "2"}, &out); err == nil || !strings.Contains(err.Error(), "not a release version") {
+		t.Errorf("bad version: err = %v", err)
 	}
 }
 
