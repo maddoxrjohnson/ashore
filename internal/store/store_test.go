@@ -59,10 +59,10 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 
 func TestOpenMigratesFromEmpty(t *testing.T) {
 	s := open(t)
-	if v := schemaVersion(t, s.db); v != 2 {
-		t.Fatalf("schema version = %d, want 2", v)
+	if v := schemaVersion(t, s.db); v != 3 {
+		t.Fatalf("schema version = %d, want 3", v)
 	}
-	for _, table := range []string{"apps", "ssh_keys", "releases"} {
+	for _, table := range []string{"apps", "ssh_keys", "releases", "config"} {
 		if !tableExists(t, s.db, table) {
 			t.Errorf("table %s missing after migration", table)
 		}
@@ -99,11 +99,11 @@ func TestOpenTwiceIsIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT count(*) FROM schema_version`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 2 {
-		t.Errorf("schema_version has %d rows, want 2: a migration ran twice", rows)
+	if rows != 3 {
+		t.Errorf("schema_version has %d rows, want 3: a migration ran twice", rows)
 	}
-	if v := schemaVersion(t, s.db); v != 2 {
-		t.Errorf("schema version = %d, want 2", v)
+	if v := schemaVersion(t, s.db); v != 3 {
+		t.Errorf("schema version = %d, want 3", v)
 	}
 }
 

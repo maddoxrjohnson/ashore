@@ -598,3 +598,76 @@ func TestListening(t *testing.T) {
 		t.Error("a server that sends a banner does not count as listening")
 	}
 }
+
+func TestConfigIsSnapshottedAndInjected(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	app, _ := f.store.GetApp(ctx, "hello")
+	if _, err := f.store.UpdateConfig(ctx, app.ID, map[string]string{"GREETING": "hi", "PORT_HINT": "x"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	spec := f.runtime.started[0]
+	if spec.Env["GREETING"] != "hi" || spec.Env["PORT_HINT"] != "x" || len(spec.Env) != 2 {
+		t.Errorf("instance env = %v", spec.Env)
+	}
+	rel, _ := f.store.LiveRelease(ctx, app.ID)
+	if rel.ConfigJSON != `{"GREETING":"hi","PORT_HINT":"x"}` {
+		t.Errorf("snapshot = %s", rel.ConfigJSON)
+	}
+	// A later change does not touch the release that already exists.
+	if _, err := f.store.UpdateConfig(ctx, app.ID, map[string]string{"GREETING": "bye"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := f.store.GetRelease(ctx, rel.ID); again.ConfigJSON != rel.ConfigJSON {
+		t.Errorf("snapshot changed after config:set: %s", again.ConfigJSON)
+	}
+}
+
+func TestRedeployRunsLiveImageWithNewConfig(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := f.store.GetApp(ctx, "hello")
+	if _, err := f.store.UpdateConfig(ctx, app.ID, map[string]string{"GREETING": "hi"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := f.sup.Redeploy(ctx, "hello", "config:set GREETING", &out); err != nil {
+		t.Fatalf("redeploy: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "-----> release v2 (config:set GREETING)\n") || strings.Contains(out.String(), "building") {
+		t.Errorf("redeploy output:\n%s", out.String())
+	}
+	if f.builder.maxSeen != 1 {
+		t.Errorf("%d builds ran; a redeploy must not build", f.builder.maxSeen)
+	}
+	if len(f.runtime.started) != 2 || f.runtime.started[1].Image != "ashore/hello:abc1234" || f.runtime.started[1].Env["GREETING"] != "hi" || f.runtime.started[1].Release != "v2" {
+		t.Errorf("second instance = %+v", f.runtime.started)
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 1 || got[0] != "inst1" {
+		t.Errorf("stopped %v, want the first instance", got)
+	}
+	rels, _ := f.store.ListReleases(ctx, app.ID)
+	if len(rels) != 2 || rels[0].Status != store.StatusSuperseded || rels[1].Status != store.StatusLive ||
+		rels[1].Image != rels[0].Image || rels[1].GitSHA != sha || rels[1].Note != "config:set GREETING" || rels[1].ConfigJSON != `{"GREETING":"hi"}` {
+		t.Errorf("releases = %+v", rels)
+	}
+}
+
+func TestRedeployNeedsALiveRelease(t *testing.T) {
+	f := newFixture(t, Config{})
+	var out bytes.Buffer
+	err := f.sup.Redeploy(context.Background(), "hello", "config:set X", &out)
+	if err == nil || !strings.Contains(err.Error(), "no live release") {
+		t.Fatalf("err = %v", err)
+	}
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 0 {
+		t.Errorf("a refused redeploy created %+v", rels)
+	}
+}

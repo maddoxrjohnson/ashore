@@ -32,6 +32,8 @@ import (
 // Store is the slice of the database the supervisor uses.
 type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
+	GetConfig(ctx context.Context, appID int64) (map[string]string, error)
+	LiveRelease(ctx context.Context, appID int64) (store.Release, error)
 	CreateRelease(ctx context.Context, appID int64, n store.NewRelease) (store.Release, error)
 	MarkBuilt(ctx context.Context, id int64, image string) error
 	MarkFailed(ctx context.Context, id int64) error
@@ -133,11 +135,24 @@ var errNotRunning = errors.New("supervisor is not running")
 // Deploy waits for the verdict (the actor sees the same ctx and stops
 // promptly), so nothing writes to out after Deploy returns.
 func (s *Supervisor) Deploy(ctx context.Context, app, sha, quarantine string, out io.Writer) error {
+	return s.send(ctx, app, deployCmd{kind: kindPush, sha: sha, quarantine: quarantine}, out)
+}
+
+// Redeploy makes a new release of the app's live image with its current
+// config vars and runs it, the way a push would. It is what a config change
+// does. note is the release note, such as "config:set GREETING". An app
+// with no live release has nothing to redeploy and gets an error.
+func (s *Supervisor) Redeploy(ctx context.Context, app, note string, out io.Writer) error {
+	return s.send(ctx, app, deployCmd{kind: kindRedeploy, note: note}, out)
+}
+
+// send hands cmd to the app's actor and waits for the verdict.
+func (s *Supervisor) send(ctx context.Context, app string, cmd deployCmd, out io.Writer) error {
 	a, err := s.actorFor(app)
 	if err != nil {
 		return err
 	}
-	cmd := deployCmd{ctx: ctx, sha: sha, quarantine: quarantine, out: out, reply: make(chan error, 1)}
+	cmd.ctx, cmd.out, cmd.reply = ctx, out, make(chan error, 1)
 	if a.busy.Load() {
 		_, _ = fmt.Fprintln(out, "-----> waiting for the current deploy to finish")
 	}
@@ -181,12 +196,23 @@ type actor struct {
 	current *runtime.Instance // the instance the router points at, if this daemon started it
 }
 
+// kind is what a deploy starts from.
+type kind int
+
+const (
+	kindPush     kind = iota // a pushed commit: build it, then run it
+	kindRedeploy             // the live image again, with the config as it is now
+)
+
 type deployCmd struct {
-	ctx        context.Context
-	sha        string
-	quarantine string
-	out        io.Writer
-	reply      chan error // buffered: the actor never waits for the caller
+	ctx   context.Context
+	kind  kind
+	sha   string // kindPush
+	note  string // kindRedeploy: the release note
+	out   io.Writer
+	reply chan error // buffered: the actor never waits for the caller
+
+	quarantine string // kindPush
 }
 
 func (a *actor) run(ctx context.Context) {
@@ -226,37 +252,73 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		return err
 	}
 
-	// The release row comes first, in status building, so the version is
-	// fixed and announced before any work starts. From here on every
-	// failure must end the row (failed), with a context that still works
-	// after the pusher's has been cancelled.
-	rel, err := s.store.CreateRelease(ctx, app.ID, store.NewRelease{GitSHA: cmd.sha, Note: "push " + short})
+	// What the release is made of. A push has a commit and no image yet; a
+	// redeploy reuses the live release's image and commit. Both snapshot
+	// the config vars as they are now, so the row says exactly what ran.
+	var n store.NewRelease
+	switch cmd.kind {
+	case kindPush:
+		n = store.NewRelease{GitSHA: cmd.sha, Note: "push " + short}
+	case kindRedeploy:
+		live, err := s.store.LiveRelease(ctx, app.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%s has no live release to redeploy; push first", a.name)
+		}
+		if err != nil {
+			return err
+		}
+		n = store.NewRelease{Image: live.Image, GitSHA: live.GitSHA, Note: cmd.note}
+	}
+	vars, err := s.store.GetConfig(ctx, app.ID)
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), short)
+	n.ConfigJSON = store.MarshalConfig(vars)
 
-	// Build, under the global cap.
-	if err := s.acquireBuild(ctx, out); err != nil {
-		a.fail(ctx, rel)
+	// The release row comes first, so the version is fixed and announced
+	// before any work starts. From here on every failure must end the row
+	// (failed), with a context that still works after the pusher's has
+	// been cancelled.
+	rel, err := s.store.CreateRelease(ctx, app.ID, n)
+	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(out, "-----> building %s\n", a.name)
-	image, err := s.builder.Build(ctx, builder.Job{
-		App: a.name, Repo: gitserver.RepoPath(s.cfg.DataDir, a.name), SHA: cmd.sha, Quarantine: cmd.quarantine,
-	}, out)
-	<-s.builds
-	if err == nil {
-		err = s.store.MarkBuilt(ctx, rel.ID, image)
+	if cmd.kind == kindPush {
+		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), short)
+	} else {
+		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), cmd.note)
 	}
+
+	// Build, under the global cap, unless the image already exists.
+	if rel.Image == "" {
+		if err := s.acquireBuild(ctx, out); err != nil {
+			a.fail(ctx, rel)
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "-----> building %s\n", a.name)
+		image, err := s.builder.Build(ctx, builder.Job{
+			App: a.name, Repo: gitserver.RepoPath(s.cfg.DataDir, a.name), SHA: cmd.sha, Quarantine: cmd.quarantine,
+		}, out)
+		<-s.builds
+		if err == nil {
+			err = s.store.MarkBuilt(ctx, rel.ID, image)
+		}
+		if err != nil {
+			a.fail(ctx, rel)
+			return err
+		}
+		rel.Image, rel.Status = image, store.StatusStarting // what MarkBuilt wrote; start needs the image
+	}
+
+	// Start and wait until it answers. The environment is the row's
+	// snapshot, not the map read above, so what runs is what the release
+	// says ran.
+	env, err := store.UnmarshalConfig(rel.ConfigJSON)
 	if err != nil {
 		a.fail(ctx, rel)
 		return err
 	}
-	rel.Image, rel.Status = image, store.StatusStarting // what MarkBuilt wrote; start needs the image
-
-	// Start and wait until it answers.
-	inst, err := a.start(ctx, rel, out)
+	inst, err := a.start(ctx, rel, env, out)
 	if err == nil && ctx.Err() != nil {
 		// The pusher is gone, so git will not record this commit. Going
 		// live anyway would leave what runs and what is pushed disagreeing.
@@ -314,17 +376,17 @@ func (s *Supervisor) acquireBuild(ctx context.Context, out io.Writer) error {
 	}
 }
 
-// start runs the release and waits for it to accept a connection. On any
-// failure the instance is stopped and removed, so a rejected push leaves
-// nothing running.
-func (a *actor) start(ctx context.Context, rel store.Release, out io.Writer) (runtime.Instance, error) {
+// start runs the release with env as its environment and waits for it to
+// accept a connection. On any failure the instance is stopped and removed,
+// so a rejected push leaves nothing running.
+func (a *actor) start(ctx context.Context, rel store.Release, env map[string]string, out io.Writer) (runtime.Instance, error) {
 	s := a.sup
 	port, err := runtime.FreePort()
 	if err != nil {
 		return runtime.Instance{}, err
 	}
 	inst, err := s.runtime.Start(ctx, runtime.Spec{
-		App: a.name, Release: rel.Name(), Image: rel.Image,
+		App: a.name, Release: rel.Name(), Image: rel.Image, Env: env,
 		HostPort: port, ContainerPort: containerPort,
 		Memory: defaultMemory, CPU: defaultCPU,
 	})
