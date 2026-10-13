@@ -37,6 +37,8 @@ import (
 // Store is the slice of the database the supervisor uses.
 type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
+	ListApps(ctx context.Context) ([]store.App, error)
+	OpenReleases(ctx context.Context) ([]store.Release, error)
 	GetConfig(ctx context.Context, appID int64) (map[string]string, error)
 	LiveRelease(ctx context.Context, appID int64) (store.Release, error)
 	ReleaseByVersion(ctx context.Context, appID int64, version int) (store.Release, error)
@@ -330,6 +332,7 @@ const (
 	kindRestart              // the live release again, as it is: no new row
 	kindRollback             // an earlier release's image and config, as a new row
 	kindDestroy              // stop everything and retire the actor
+	kindAdopt                // take over an instance found running at start
 )
 
 type deployCmd struct {
@@ -344,6 +347,8 @@ type deployCmd struct {
 	quarantine string // kindPush
 	manual     bool   // kindRestart: asked for, not scheduled; resets the failure history
 	host       string // kindDestroy: the route to remove
+	adopt      *running
+	adoptHost  string // kindAdopt: the instance and the route to restore
 }
 
 func (a *actor) run(ctx context.Context) {
@@ -358,6 +363,10 @@ func (a *actor) run(ctx context.Context) {
 			if cmd.kind == kindDestroy {
 				cmd.reply <- a.destroy(cmd)
 				return
+			}
+			if cmd.kind == kindAdopt {
+				cmd.reply <- a.adopt(cmd)
+				continue
 			}
 			a.busy.Store(true)
 			cmd.reply <- a.deploy(cmd)
@@ -385,6 +394,23 @@ func (a *actor) watch(ctx context.Context, inst runtime.Instance) {
 	case <-a.done:
 	case <-ctx.Done():
 	}
+}
+
+// adopt makes an instance found running at start the actor's current one:
+// route restored, watcher started, no release change. Reconcile is the only
+// caller, before any deploy for the app, so nothing is replaced.
+func (a *actor) adopt(cmd deployCmd) error {
+	s := a.sup
+	if a.current != nil {
+		return fmt.Errorf("%s already has an instance", a.name)
+	}
+	a.current = cmd.adopt
+	s.router.Set(cmd.adoptHost, cmd.adopt.inst.Addr)
+	a.setStatus(StateRunning, "adopted at start")
+	s.actors.Add(1)
+	go a.watch(s.ctx, cmd.adopt.inst)
+	s.log.Info("instance adopted", "app", a.name, "id", cmd.adopt.inst.ID, "release", cmd.adopt.inst.Release, "addr", cmd.adopt.inst.Addr)
+	return nil
 }
 
 // destroy is the actor's last act: stop what runs, drop the route, and

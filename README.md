@@ -25,8 +25,9 @@ gets traffic only after its health check passes, the route moves in one atomic s
 the old instance keeps running for a drain period before it is stopped. An instance that
 exits on its own is restarted with exponential backoff (1, 2, 4, up to 60 seconds) and
 given up on after ten failures in ten minutes, which `ps` reports. The `ashore` command
-talks to the daemon's API: apps, config, releases, rollback, restart, `ps`, keys. Restoring
-routes after a daemon restart is next.
+talks to the daemon's API: apps, config, releases, rollback, restart, `ps`, keys. A daemon
+restart changes nothing for the apps: containers keep serving while it is down, and on start
+it reconciles what is running with what should be before it opens a single port.
 
 ## Zero-downtime deploys, measured
 
@@ -134,8 +135,20 @@ The build context is `git archive` of the pushed commit, so only tracked files r
 build and `.dockerignore` has no effect. To keep tracked files out of the image, mark them
 `export-ignore` in `.gitattributes`.
 
-A daemon restart does not yet re-attach the containers it started; until reconciliation
-lands, `docker ps --filter label=ashore.app` shows what is running.
+## Daemon restarts
+
+The containers belong to Docker, not to the daemon, so they keep serving while `ashored` is
+stopped. On start the daemon lists the containers it labelled and compares them with each
+app's live release: a running instance of the live release is adopted (route restored,
+crash watcher started), anything else running is an orphan and is stopped, exited containers
+are removed, a live release with nothing running is started again, and a release left
+`building` or `starting` by a cut-off deploy is marked `failed`. One log line reports the
+counts:
+
+    msg=reconciled adopted=1 restarted=0 orphans=0 removed=0 failed=0
+
+This runs before any listener opens, so there is no window of 404s. Restart counts live in
+memory and start over with the daemon; `ps` shows that.
 
 ## Build and run
 

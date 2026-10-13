@@ -90,6 +90,26 @@ func TestCreateReleaseRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestOpenReleases(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	a, b := newApp(t, s, "a"), newApp(t, s, "b")
+	building := mustRelease(t, s, a.ID, NewRelease{})
+	starting := mustRelease(t, s, b.ID, NewRelease{Image: "img"})
+	live := mustRelease(t, s, a.ID, NewRelease{Image: "img"})
+	if err := s.SetLive(ctx, a.ID, live.ID); err != nil {
+		t.Fatal(err)
+	}
+	failed := mustRelease(t, s, a.ID, NewRelease{})
+	if err := s.MarkFailed(ctx, failed.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.OpenReleases(ctx)
+	if err != nil || len(got) != 2 || got[0].ID != building.ID || got[1].ID != starting.ID {
+		t.Errorf("OpenReleases = %+v, %v; want the building and starting rows", got, err)
+	}
+}
+
 func TestParseVersion(t *testing.T) {
 	for in, want := range map[string]int{"v1": 1, "v42": 42, "1": 0, "v": 0, "v0": 0, "v-1": 0, "v+1": 0, "vx": 0, "": 0, "V2": 0} {
 		got, err := ParseVersion(in)

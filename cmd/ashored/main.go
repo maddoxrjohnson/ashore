@@ -96,8 +96,15 @@ func run() error {
 			DrainGrace:       cfg.DrainGrace,
 		}, slog.Default())
 
-	// The admin token is created on the first run; the CLI and the admin
-	// subcommands read the file.
+	// Routes live in memory, so they are rebuilt from what is running
+	// before any listener opens; a daemon restart is then invisible from
+	// outside. An unreachable Docker makes this a warning: the daemon still
+	// starts, and the next deploy says what is wrong.
+	if rep, err := sup.Reconcile(ctx); err != nil {
+		slog.Warn("reconcile", "err", err, "partial", rep.String())
+	}
+
+	// The admin token is created on the first run; the CLI reads the file.
 	token, err := api.LoadToken(cfg.DataDir)
 	if err != nil {
 		return err

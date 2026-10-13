@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +82,7 @@ type fakeRuntime struct {
 	handler  http.Handler // when set, each instance serves HTTP with it
 
 	mu        sync.Mutex
+	found     []runtime.Instance // what List reports before anything is started here
 	started   []runtime.Spec
 	stopped   []string
 	graces    map[string]time.Duration // id -> grace given to Stop
@@ -197,6 +199,16 @@ func (r *fakeRuntime) List(context.Context) ([]runtime.Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []runtime.Instance
+	for _, inst := range r.found {
+		if ch, ok := r.gone[inst.ID]; ok {
+			select {
+			case <-ch:
+				continue // removed
+			default:
+			}
+		}
+		out = append(out, inst)
+	}
 	for i, spec := range r.started {
 		id := "inst" + strconv.Itoa(i+1)
 		running := true
@@ -1168,6 +1180,131 @@ func TestDestroyStopsAndForgets(t *testing.T) {
 	}
 	if err := f.sup.Destroy(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("destroy unknown: %v", err)
+	}
+}
+
+func TestReconcile(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	st := f.store
+	mk := func(name string) store.App {
+		t.Helper()
+		if name != "hello" {
+			if _, err := st.CreateApp(ctx, name, name+".localhost"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a, _ := st.GetApp(ctx, name)
+		return a
+	}
+	goLive := func(app store.App, version int) store.Release {
+		t.Helper()
+		var rel store.Release
+		for v := 1; v <= version; v++ {
+			r, err := st.CreateRelease(ctx, app.ID, store.NewRelease{Image: fmt.Sprintf("ashore/%s:%d", app.Name, v), ManifestJSON: `{"process":{"grace":"3s"}}`})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.SetLive(ctx, app.ID, r.ID); err != nil {
+				t.Fatal(err)
+			}
+			rel = r
+		}
+		return rel
+	}
+	// hello: live v2, one running v2 (adopt), one running v1 (orphan), one exited v2 (remove).
+	hello := mk("hello")
+	goLive(hello, 2)
+	// api: live v1, nothing running: restart.
+	api := mk("api")
+	goLive(api, 1)
+	// idle: no live release, but a container runs: orphan.
+	mk("idle")
+	// A release cut off mid-deploy.
+	cut, err := st.CreateRelease(ctx, api.ID, store.NewRelease{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A listener for the adopted instance, so its address is real.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	f.runtime.found = []runtime.Instance{
+		{ID: "hello-v2", App: "hello", Release: "v2", Addr: ln.Addr().String(), Running: true},
+		{ID: "hello-v1", App: "hello", Release: "v1", Addr: "127.0.0.1:1", Running: true},
+		{ID: "hello-dead", App: "hello", Release: "v2", Running: false},
+		{ID: "idle-v1", App: "idle", Release: "v1", Addr: "127.0.0.1:2", Running: true},
+		{ID: "ghost-v3", App: "ghost", Release: "v3", Addr: "127.0.0.1:3", Running: true},
+	}
+
+	rep, err := f.sup.Reconcile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep != (Report{Adopted: 1, Restarted: 1, Orphans: 3, Removed: 1, Failed: 1}) {
+		t.Errorf("report = %+v", rep)
+	}
+	if addr, _ := f.router.Get("hello.localhost"); addr != ln.Addr().String() {
+		t.Errorf("hello route = %q, want the adopted instance", addr)
+	}
+	s, ok := f.sup.Status("hello")
+	if !ok || s.State != StateRunning || s.Instance != "hello-v2" || s.Release != "v2" {
+		t.Errorf("hello status = %+v", s)
+	}
+	stopped := f.runtime.stoppedIDs()
+	for _, id := range []string{"hello-v1", "hello-dead", "idle-v1", "ghost-v3"} {
+		if !slices.Contains(stopped, id) {
+			t.Errorf("%s not removed; stopped %v", id, stopped)
+		}
+	}
+	if slices.Contains(stopped, "hello-v2") {
+		t.Error("the adopted instance was stopped")
+	}
+	if got, _ := st.GetRelease(ctx, cut.ID); got.Status != store.StatusFailed {
+		t.Errorf("cut-off release = %s, want failed", got.Status)
+	}
+	// api comes back in the background through the normal path.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if addr, ok := f.router.Get("api.localhost"); ok && addr != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("api was not restarted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(f.runtime.started) != 1 || f.runtime.started[0].App != "api" || f.runtime.started[0].Image != "ashore/api:1" {
+		t.Errorf("started %+v, want one instance of api v1", f.runtime.started)
+	}
+	if s, _ := f.sup.Status("api"); s.State != StateRunning || s.Restarts != 1 {
+		t.Errorf("api status = %+v", s)
+	}
+	// The adopted instance is watched: its exit schedules a restart.
+	f.runtime.exit("hello-v2", 1)
+	f.waitState(t, StateRestarting, "")
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("adopted instance's first crash waited %s", d)
+	}
+	f.waitState(t, StateRunning, "hello-v2")
+	// A second deploy of hello replaces the adopted instance with the grace
+	// its live manifest set.
+	f.runtime.mu.Lock()
+	grace := f.runtime.graces["hello-v2"]
+	f.runtime.mu.Unlock()
+	_ = grace
+}
+
+func TestReconcileWithNothing(t *testing.T) {
+	f := newFixture(t, Config{})
+	rep, err := f.sup.Reconcile(context.Background())
+	if err != nil || rep != (Report{}) {
+		t.Errorf("reconcile of an empty world = %+v, %v", rep, err)
+	}
+	if rep.String() != "adopted=0 restarted=0 orphans=0 removed=0 failed=0" {
+		t.Errorf("String = %q", rep.String())
 	}
 }
 
