@@ -56,12 +56,12 @@ func run() error {
 	}
 	slog.SetDefault(newLogger(os.Stderr, cfg))
 
+	if flag.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments %q; the ashore command talks to the daemon", flag.Args())
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	if flag.NArg() > 0 {
-		return admin(ctx, cfg, flag.Args(), os.Stdout)
-	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("data dir: %w", err)
@@ -102,7 +102,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	as := api.New(st, sup, token, slog.Default())
+	as := api.New(st, sup, token, api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}, slog.Default())
 
 	hs, err := hook.NewServer(cfg.DataDir, sup)
 	if err != nil {

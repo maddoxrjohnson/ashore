@@ -55,6 +55,7 @@ type Builder interface {
 type Router interface {
 	Set(host, addr string)
 	Get(host string) (addr string, ok bool)
+	Remove(host string)
 }
 
 // Config is what a deploy needs to know about its surroundings.
@@ -206,6 +207,37 @@ func (s *Supervisor) Restart(ctx context.Context, app string, out io.Writer) err
 	return s.send(ctx, app, deployCmd{kind: kindRestart, manual: true}, out)
 }
 
+// Destroy stops the app's instance, removes its route, and retires its
+// actor, so nothing of the app runs or is reachable. The caller removes the
+// rows and the repository afterwards; the order means a failure there
+// leaves an app that exists but serves nothing, never one that serves
+// without existing.
+func (s *Supervisor) Destroy(ctx context.Context, app string) error {
+	a, err := s.store.GetApp(ctx, app)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	act, ok := s.apps[app]
+	s.mu.Unlock()
+	if !ok {
+		// Nothing was started since the daemon came up; there may still be
+		// a route from reconcile.
+		s.router.Remove(a.Host)
+		return nil
+	}
+	cmd := deployCmd{ctx: ctx, kind: kindDestroy, host: a.Host, reply: make(chan error, 1)}
+	select {
+	case act.cmds <- cmd:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-act.done:
+		s.router.Remove(a.Host) // retired already; the route is all that could be left
+		return nil
+	}
+	return <-cmd.reply
+}
+
 // send hands cmd to the app's actor and waits for the verdict.
 func (s *Supervisor) send(ctx context.Context, app string, cmd deployCmd, out io.Writer) error {
 	a, err := s.actorFor(app)
@@ -297,6 +329,7 @@ const (
 	kindRedeploy             // the live image again, with the config as it is now
 	kindRestart              // the live release again, as it is: no new row
 	kindRollback             // an earlier release's image and config, as a new row
+	kindDestroy              // stop everything and retire the actor
 )
 
 type deployCmd struct {
@@ -310,16 +343,22 @@ type deployCmd struct {
 
 	quarantine string // kindPush
 	manual     bool   // kindRestart: asked for, not scheduled; resets the failure history
+	host       string // kindDestroy: the route to remove
 }
 
 func (a *actor) run(ctx context.Context) {
 	defer a.sup.actors.Done()
 	defer close(a.done)
+	defer a.sup.forget(a.name)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case cmd := <-a.cmds:
+			if cmd.kind == kindDestroy {
+				cmd.reply <- a.destroy(cmd)
+				return
+			}
 			a.busy.Store(true)
 			cmd.reply <- a.deploy(cmd)
 			a.busy.Store(false)
@@ -333,7 +372,8 @@ func (a *actor) run(ctx context.Context) {
 }
 
 // watch waits for one instance to exit and reports it. The actor decides
-// what the exit means; the watcher only knows that it happened.
+// what the exit means; the watcher only knows that it happened. A watcher
+// whose actor has gone (destroy) has no one to tell and ends.
 func (a *actor) watch(ctx context.Context, inst runtime.Instance) {
 	defer a.sup.actors.Done()
 	code, err := a.sup.runtime.Wait(ctx, inst.ID)
@@ -342,7 +382,43 @@ func (a *actor) watch(ctx context.Context, inst runtime.Instance) {
 	}
 	select {
 	case a.exits <- exitEvent{id: inst.ID, code: code, err: err}:
+	case <-a.done:
 	case <-ctx.Done():
+	}
+}
+
+// destroy is the actor's last act: stop what runs, drop the route, and
+// report nothing running. The instance gets its own grace, no drain: the
+// route is gone at the same moment, and there is no new release for
+// requests to move to.
+func (a *actor) destroy(cmd deployCmd) error {
+	s := a.sup
+	a.retry = nil
+	s.router.Remove(cmd.host)
+	if cur := a.current; cur != nil && !cur.exited {
+		if err := s.runtime.Stop(context.WithoutCancel(cmd.ctx), cur.inst.ID, cur.grace); err != nil {
+			return fmt.Errorf("stop %s: %w", cur.inst.Release, err)
+		}
+		s.log.Info("instance stopped", "app", a.name, "id", cur.inst.ID, "release", cur.inst.Release, "reason", "destroy")
+	}
+	a.current = nil
+	a.setStatus(StateStopped, "destroyed")
+	return nil
+}
+
+// forget drops an actor that has returned, so a later command for the same
+// name starts a fresh one instead of finding a closed channel.
+func (s *Supervisor) forget(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.apps[name]; ok && a.done != nil {
+		select {
+		case <-a.done:
+		default:
+			// run defers forget before close(done); the channel closes
+			// right after this returns. The map entry still goes.
+		}
+		delete(s.apps, name)
 	}
 }
 

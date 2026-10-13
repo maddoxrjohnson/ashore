@@ -1124,6 +1124,53 @@ func TestRollbackRunsTheOldImageAndConfig(t *testing.T) {
 	}
 }
 
+func TestDestroyStopsAndForgets(t *testing.T) {
+	f := newFixture(t, Config{DrainGrace: time.Hour})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.sup.Destroy(ctx, "hello"); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 1 || got[0] != "inst1" {
+		t.Errorf("stopped %v, want the instance, at once", got)
+	}
+	if _, ok := f.router.Get("hello.localhost"); ok {
+		t.Error("route left after destroy")
+	}
+	st, ok := f.sup.Status("hello")
+	if ok {
+		t.Errorf("status after destroy = %+v, want none", st)
+	}
+	// The watcher saw the exit and had no one to tell; nothing restarts.
+	time.Sleep(50 * time.Millisecond)
+	if f.clock.pending() {
+		t.Error("a restart was scheduled for a destroyed app")
+	}
+	// The name is free again: a new deploy starts a fresh actor.
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatalf("deploy after destroy: %v", err)
+	}
+	if st, _ := f.sup.Status("hello"); st.State != StateRunning || st.Instance != "inst2" {
+		t.Errorf("status after redeploy = %+v", st)
+	}
+	// An app nothing ran for: only the route (if any) goes.
+	if _, err := f.store.CreateApp(ctx, "idle", "idle.localhost"); err != nil {
+		t.Fatal(err)
+	}
+	f.router.Set("idle.localhost", "127.0.0.1:1")
+	if err := f.sup.Destroy(ctx, "idle"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.router.Get("idle.localhost"); ok {
+		t.Error("idle app's route left")
+	}
+	if err := f.sup.Destroy(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("destroy unknown: %v", err)
+	}
+}
+
 func TestStatusBeforeAnything(t *testing.T) {
 	f := newFixture(t, Config{})
 	if _, ok := f.sup.Status("hello"); ok {

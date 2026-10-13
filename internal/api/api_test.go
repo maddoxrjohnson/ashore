@@ -48,6 +48,13 @@ func (f *fakeSup) Rollback(_ context.Context, app string, version int, out io.Wr
 	return f.err
 }
 
+func (f *fakeSup) Destroy(_ context.Context, app string) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, app+": destroy")
+	f.mu.Unlock()
+	return f.err
+}
+
 func (f *fakeSup) Status(app string) (supervisor.Status, bool) {
 	st, ok := f.status[app]
 	return st, ok
@@ -70,11 +77,12 @@ func (f *fakeSup) redeploys() []string {
 }
 
 type fixture struct {
-	store  *store.Store
-	sup    *fakeSup
-	server *httptest.Server
-	client *Client
-	app    store.App
+	store   *store.Store
+	sup     *fakeSup
+	server  *httptest.Server
+	client  *Client
+	app     store.App
+	dataDir string
 }
 
 // newFixture serves the API over a real store with one app, hello.
@@ -91,7 +99,9 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{store: st, sup: &fakeSup{}, app: app}
-	f.server = httptest.NewServer(New(st, f.sup, token, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	f.dataDir = t.TempDir()
+	f.server = httptest.NewServer(New(st, f.sup, token, Config{DataDir: f.dataDir, Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
+		slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(f.server.Close)
 	f.client = &Client{URL: f.server.URL, Token: token, HTTP: f.server.Client()}
 	return f

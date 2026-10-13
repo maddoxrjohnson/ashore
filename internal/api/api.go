@@ -26,9 +26,35 @@ import (
 // Store is the slice of the database the API reads and writes.
 type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
+	CreateApp(ctx context.Context, name, host string) (store.App, error)
+	DeleteApp(ctx context.Context, name string) error
+	ListApps(ctx context.Context) ([]store.App, error)
 	GetConfig(ctx context.Context, appID int64) (map[string]string, error)
 	UpdateConfig(ctx context.Context, appID int64, set map[string]string, unset []string) (bool, error)
 	LiveRelease(ctx context.Context, appID int64) (store.Release, error)
+	ListReleases(ctx context.Context, appID int64) ([]store.Release, error)
+	ReleaseByVersion(ctx context.Context, appID int64, version int) (store.Release, error)
+	AddKey(ctx context.Context, name, fingerprint, pubkey string) (store.Key, error)
+}
+
+// Config is what the API needs to know about the daemon it fronts.
+type Config struct {
+	DataDir string // where app repositories are created and removed
+	Domain  string // apps are <name>.<Domain>
+	SSHAddr string // the git listener, for the remote URL apps:create prints
+}
+
+// RemoteURL is the git remote a pusher adds for app: the SSH listener's
+// host and port, or the domain when it listens on every interface.
+func (c Config) RemoteURL(app string) string {
+	host, port, err := net.SplitHostPort(c.SSHAddr)
+	if err != nil {
+		return "ssh://ashore@" + c.Domain + "/" + app
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = c.Domain
+	}
+	return "ssh://ashore@" + net.JoinHostPort(host, port) + "/" + app
 }
 
 // Supervisor is what the API asks the deploy machinery to do and to report.
@@ -36,6 +62,8 @@ type Supervisor interface {
 	Redeploy(ctx context.Context, app, note string, out io.Writer) error
 	Rollback(ctx context.Context, app string, version int, out io.Writer) error
 	Restart(ctx context.Context, app string, out io.Writer) error
+	// Destroy stops the app's instance and removes its route.
+	Destroy(ctx context.Context, app string) error
 	// Status is the app's instance as the supervisor sees it; ok is false
 	// when it has never started one since the daemon came up.
 	Status(app string) (st supervisor.Status, ok bool)
@@ -53,17 +81,25 @@ type Server struct {
 	store Store
 	sup   Supervisor
 	token []byte
+	cfg   Config
 	log   *slog.Logger
 	mux   *http.ServeMux
 }
 
 // New wires the routes. token is the admin token every request must carry.
 // A nil logger means slog.Default.
-func New(st Store, sup Supervisor, token string, log *slog.Logger) *Server {
+func New(st Store, sup Supervisor, token string, cfg Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: st, sup: sup, token: []byte(token), log: log, mux: http.NewServeMux()}
+	s := &Server{store: st, sup: sup, token: []byte(token), cfg: cfg, log: log, mux: http.NewServeMux()}
+	s.mux.HandleFunc("GET /api/v1/apps", s.listApps)
+	s.mux.HandleFunc("POST /api/v1/apps", s.createApp)
+	s.mux.HandleFunc("GET /api/v1/apps/{app}", s.getApp)
+	s.mux.HandleFunc("DELETE /api/v1/apps/{app}", s.destroyApp)
+	s.mux.HandleFunc("GET /api/v1/apps/{app}/releases", s.listReleases)
+	s.mux.HandleFunc("GET /api/v1/apps/{app}/releases/{version}", s.getRelease)
+	s.mux.HandleFunc("POST /api/v1/keys", s.addKey)
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/config", s.getConfig)
 	s.mux.HandleFunc("PATCH /api/v1/apps/{app}/config", s.updateConfig)
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/ps", s.ps)

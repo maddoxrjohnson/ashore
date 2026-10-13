@@ -24,8 +24,9 @@ release of the same image and redeploys it. A deploy drops no requests: the new 
 gets traffic only after its health check passes, the route moves in one atomic swap, and
 the old instance keeps running for a drain period before it is stopped. An instance that
 exits on its own is restarted with exponential backoff (1, 2, 4, up to 60 seconds) and
-given up on after ten failures in ten minutes, which `ps` reports. The CLI and restoring
-routes after a daemon restart are next.
+given up on after ten failures in ten minutes, which `ps` reports. The `ashore` command
+talks to the daemon's API: apps, config, releases, rollback, restart, `ps`, keys. Restoring
+routes after a daemon restart is next.
 
 ## Zero-downtime deploys, measured
 
@@ -58,10 +59,8 @@ failures within a ten-minute window; the tenth failure in the window marks the a
 `crashed` and nothing more is tried until a restart is asked for. The route stays where it
 was, so requests to a crashed app get a 502 with a request id rather than a 404.
 `examples/crasher` exits two seconds after it starts when `CRASH_AFTER=2s` is set, and
-
-    curl -H "Authorization: Bearer $(cat data/admin.token)" http://127.0.0.1:9000/api/v1/apps/crasher/ps
-
-shows the state, the restart count, and when the next attempt is due.
+`ashore ps crasher` shows the state, the restart count, and when the next attempt is due.
+`ashore restart crasher` ends a crash loop once its cause is fixed.
 
 An optional `ashore.toml` at the root of the repository tunes the deploy. Every value is
 optional; this is the full set with the defaults:
@@ -82,10 +81,12 @@ daemon does not know, rejects the push with the error as the last line.
 
 ## Deploying an app locally
 
-With Docker running and the daemon started (`make run`, text logs on stderr):
+With Docker running and the daemon started (`make run`, text logs on stderr), log the CLI
+in with the token the daemon wrote on its first start, then create an app and push:
 
-    ./bin/ashored apps create hello           # app row, bare repo, prints the remote
-    ./bin/ashored keys add me ~/.ssh/id_ed25519.pub
+    ./bin/ashore login http://127.0.0.1:9000 $(cat data/admin.token)
+    ./bin/ashore apps:create hello            # app row, bare repo, prints the remote
+    ./bin/ashore keys:add me ~/.ssh/id_ed25519.pub
     cd examples/hello-go
     git init -b main && git add -A && git commit -m "first"
     git remote add ashore ssh://ashore@localhost:2222/hello
@@ -96,35 +97,45 @@ The push prints `release v1`, the build steps, and `live at http://hello.localho
 With an `ashore.toml` in the repository the push also prints the settings it read.
 Change the string in `main.go`, commit, push again, and curl shows the new one. Break the
 `Dockerfile`, push, and the push is rejected while the old version keeps serving.
-`./bin/ashored releases list hello` shows the history, the rejected push included as a
-`failed` release; `releases info hello v2` shows one release's image, commit, config, and
+`ashore releases hello` shows the history, the rejected push included as a `failed`
+release; `ashore releases:info hello v2` shows one release's image, commit, config, and
 manifest.
 
 Config vars are set through the daemon, which redeploys the live release with the new
 environment and streams the deploy to your terminal:
 
-    ./bin/ashored config set hello GREETING=hi      # release v3, same image, new env
-    ./bin/ashored config get hello                  # GREETING=hi
-    ./bin/ashored config unset hello GREETING       # release v4
+    ./bin/ashore config:set hello GREETING=hi       # release v3, same image, new env
+    ./bin/ashore config:get hello                   # GREETING=hi
+    ./bin/ashore config:unset hello GREETING        # release v4
 
 `examples/config-reader` answers every request with `$GREETING`, so a curl after each
 command shows the change. The daemon sets `PORT` itself and refuses it as a config var.
-Values are never written to the daemon's log; `releases info` shows the snapshot a release
+Values are never written to the daemon's log; `releases:info` shows the snapshot a release
 ran with.
 
-The daemon's own API listens on `ASHORE_INTERNAL_ADDR` (default `127.0.0.1:9000`) and
-requires the admin token it writes to `data/admin.token` on first start, as a bearer
-token. The admin subcommands read that file; the `ashore` CLI will do the same over the
-network.
+A rollback is a new release made from an old one's image, config, and manifest, so the
+history never rewrites itself; a restart replaces the live release's instance and clears a
+crash loop:
+
+    ./bin/ashore releases:rollback hello v2         # release v5 (rollback v2)
+    ./bin/ashore restart hello
+    ./bin/ashore ps hello                           # instance, state, restarts, uptime
+    ./bin/ashore apps:destroy hello                 # stops it, removes rows and repository
+
+Every list and show command takes `--json`. `ashore login` stores the daemon's address and
+token in `$XDG_CONFIG_HOME/ashore/config` (or `ASHORE_CONFIG`); `ASHORE_URL` and
+`ASHORE_TOKEN` override it, which is how scripts and CI use the CLI.
+
+The daemon's API listens on `ASHORE_INTERNAL_ADDR` (default `127.0.0.1:9000`) and requires
+the admin token it writes to `data/admin.token` on first start, as a bearer token. It is
+never exposed on the router's port; from another machine, reach it through an SSH tunnel.
 
 The build context is `git archive` of the pushed commit, so only tracked files reach the
 build and `.dockerignore` has no effect. To keep tracked files out of the image, mark them
 `export-ignore` in `.gitattributes`.
 
-The admin subcommands (`apps create`, `keys add`, `releases list`, `releases info`,
-`config get/set/unset`) are a stopgap until the `ashore` CLI exists. A daemon restart does
-not yet re-attach the containers it started;
-until reconciliation lands, `docker ps --filter label=ashore.app` shows what is running.
+A daemon restart does not yet re-attach the containers it started; until reconciliation
+lands, `docker ps --filter label=ashore.app` shows what is running.
 
 ## Build and run
 

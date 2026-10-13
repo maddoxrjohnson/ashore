@@ -28,6 +28,70 @@ func (c *Client) Config(ctx context.Context, app string) (map[string]string, err
 	return vars, err
 }
 
+// Apps lists every app.
+func (c *Client) Apps(ctx context.Context) ([]App, error) {
+	var out []App
+	err := c.getJSON(ctx, "/api/v1/apps", &out)
+	return out, err
+}
+
+// App returns one app.
+func (c *Client) App(ctx context.Context, name string) (App, error) {
+	var out App
+	err := c.getJSON(ctx, "/api/v1/apps/"+name, &out)
+	return out, err
+}
+
+// CreateApp creates an app and its repository.
+func (c *Client) CreateApp(ctx context.Context, name string) (App, error) {
+	var out App
+	err := c.postJSON(ctx, "/api/v1/apps", CreateAppRequest{Name: name}, &out)
+	return out, err
+}
+
+// DestroyApp stops and removes an app.
+func (c *Client) DestroyApp(ctx context.Context, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/api/v1/apps/"+name, nil)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// Releases lists an app's releases, oldest first.
+func (c *Client) Releases(ctx context.Context, app string) ([]Release, error) {
+	var out []Release
+	err := c.getJSON(ctx, "/api/v1/apps/"+app+"/releases", &out)
+	return out, err
+}
+
+// Release returns one release by name ("v3").
+func (c *Client) Release(ctx context.Context, app, version string) (Release, error) {
+	var out Release
+	err := c.getJSON(ctx, "/api/v1/apps/"+app+"/releases/"+version, &out)
+	return out, err
+}
+
+// AddKey registers a public key (one authorized_keys line).
+func (c *Client) AddKey(ctx context.Context, name, pubkey string) (Key, error) {
+	var out Key
+	err := c.postJSON(ctx, "/api/v1/keys", AddKeyRequest{Name: name, PubKey: pubkey}, &out)
+	return out, err
+}
+
+// postJSON sends body and decodes the 2xx answer into v.
+func (c *Client) postJSON(ctx context.Context, path string, body, v any) error {
+	resp, err := c.do(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	return nil
+}
+
 // Restart restarts the app's live release, streaming progress to out.
 func (c *Client) Restart(ctx context.Context, app string, out io.Writer) error {
 	resp, err := c.do(ctx, http.MethodPost, "/api/v1/apps/"+app+"/restart", struct{}{})
