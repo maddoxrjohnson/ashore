@@ -66,6 +66,9 @@ type Config struct {
 	// the app's ashore.toml says otherwise.
 	HealthTimeout time.Duration
 	StopGrace     time.Duration
+	// DrainGrace is how long a replaced instance keeps running after the
+	// route moved away from it, so requests it was already handling finish.
+	DrainGrace time.Duration
 }
 
 // Instance defaults for what ashore.toml leaves out.
@@ -126,8 +129,10 @@ func New(st Store, b Builder, rt runtime.Runtime, r Router, cfg Config, log *slo
 }
 
 // Run blocks until ctx is done, then ends every actor and waits for them.
-// Deploys in progress see a cancelled context and fail; nothing is stopped
-// on the way out, since containers outlive the daemon on purpose.
+// Deploys in progress see a cancelled context and fail; nothing live is
+// stopped on the way out, since containers outlive the daemon on purpose.
+// An instance that was already replaced and is draining is stopped at once
+// rather than left for reconcile to find.
 func (s *Supervisor) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
@@ -380,16 +385,36 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 	s.log.Info("route swapped", "app", a.name, "release", rel.Name(), "addr", inst.Addr)
 	_, _ = fmt.Fprintf(out, "-----> live at %s\n", s.url(app.Host))
 
-	bg := context.WithoutCancel(ctx)
 	if old != nil {
-		if err := s.runtime.Stop(bg, old.inst.ID, old.grace); err != nil {
-			s.log.Warn("stop old instance", "app", a.name, "id", old.inst.ID, "err", err)
-		}
+		a.retire(old)
 	}
-	if err := s.store.SetLive(bg, app.ID, rel.ID); err != nil {
+	if err := s.store.SetLive(context.WithoutCancel(ctx), app.ID, rel.ID); err != nil {
 		s.log.Error("mark release live", "app", a.name, "release", rel.Name(), "err", err)
 	}
 	return nil
+}
+
+// retire stops an instance the route no longer points at, after the drain
+// grace, so requests the proxy had already sent it finish. It runs in its
+// own goroutine so the actor is free for the next command at once; the
+// supervisor's lifetime bounds it, and a daemon shutting down stops the
+// instance without the rest of the wait, because it is superseded either
+// way and reconcile would only have to find it later.
+func (a *actor) retire(old *running) {
+	s := a.sup
+	s.actors.Add(1)
+	go func() {
+		defer s.actors.Done()
+		select {
+		case <-time.After(s.cfg.DrainGrace):
+		case <-s.ctx.Done():
+		}
+		if err := s.runtime.Stop(context.WithoutCancel(s.ctx), old.inst.ID, old.grace); err != nil {
+			s.log.Warn("stop old instance", "app", a.name, "id", old.inst.ID, "err", err)
+			return
+		}
+		s.log.Info("old instance stopped", "app", a.name, "id", old.inst.ID, "release", old.inst.Release, "drained", s.cfg.DrainGrace)
+	}()
 }
 
 // fail ends a release that will not go live. It uses a context that

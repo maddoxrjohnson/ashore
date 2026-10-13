@@ -20,8 +20,33 @@ rejects the push and the previous release keeps serving. The proxy routes by hos
 a copy-on-write table, so requests never take a lock, and every response carries an
 `X-Request-Id` that also appears in the access log. Config vars are per-app environment
 variables: each release snapshots them when it is created, and changing one makes a new
-release of the same image and redeploys it. Zero-downtime swaps, crash restarts, the CLI,
-and restoring routes after a daemon restart are next.
+release of the same image and redeploys it. A deploy drops no requests: the new instance
+gets traffic only after its health check passes, the route moves in one atomic swap, and
+the old instance keeps running for a drain period before it is stopped. Crash restarts, the
+CLI, and restoring routes after a daemon restart are next.
+
+## Zero-downtime deploys, measured
+
+`examples/slowstart` sleeps ten seconds before it listens and shuts down cleanly on SIGTERM.
+With `scripts/loadloop` sending 200 requests a second through the router and
+`scripts/deploys.sh` pushing ten deploys back to back:
+
+    requests=24747 ok=24747 failed=0 (none) distinct bodies=11 p50=730µs p99=1.85ms max=15.7ms
+
+Zero failed requests in 24,747 across ten deploys (measured 2026-10-12 on the Docker
+runtime in WSL2). Eleven distinct bodies means every release answered during the run, so
+the swaps happened; the daemon log shows eleven route swaps and ten old instances stopped
+after the five-second drain. To reproduce:
+
+    ./bin/ashored apps create slowstart
+    # push examples/slowstart once, then:
+    go run ./scripts/loadloop -host slowstart.localhost -rate 200 &
+    sh scripts/deploys.sh /path/to/slowstart-checkout 10
+    kill -INT %1; wait
+
+`ASHORE_DRAIN_GRACE` (default `5s`) is how long a replaced instance keeps running after the
+route moved away from it. The app's own `[process] grace` is the SIGTERM-to-SIGKILL window
+once the stop begins.
 
 An optional `ashore.toml` at the root of the repository tunes the deploy. Every value is
 optional; this is the full set with the defaults:

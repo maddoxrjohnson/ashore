@@ -93,6 +93,7 @@ func run() error {
 			BuildConcurrency: cfg.BuildConcurrency,
 			HealthTimeout:    cfg.HealthTimeout,
 			StopGrace:        cfg.StopGrace,
+			DrainGrace:       cfg.DrainGrace,
 		}, slog.Default())
 
 	// The admin token is created on the first run; the CLI and the admin

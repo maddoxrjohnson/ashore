@@ -247,6 +247,23 @@ func (f *fixture) deploy(ctx context.Context, app string) (string, error) {
 	return out.String(), err
 }
 
+// waitStopped returns the stopped instances once there are n of them, or
+// fails the test after a few seconds. Replaced instances are stopped after
+// the drain grace, in the background, so a test cannot look right away.
+func (f *fixture) waitStopped(t *testing.T, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := f.runtime.stoppedIDs(); len(got) >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stopped %v, want %d instances", f.runtime.stoppedIDs(), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestDeployHappyPath(t *testing.T) {
 	f := newFixture(t, Config{})
 	out, err := f.deploy(context.Background(), "hello")
@@ -299,13 +316,59 @@ func TestSecondDeployReplacesFirst(t *testing.T) {
 	if first == second {
 		t.Error("route did not move to the new instance")
 	}
-	if got := f.runtime.stoppedIDs(); len(got) != 1 || got[0] != "inst1" {
+	if got := f.waitStopped(t, 1); len(got) != 1 || got[0] != "inst1" {
 		t.Errorf("stopped %v, want the first instance only", got)
 	}
 	app, _ := f.store.GetApp(ctx, "hello")
 	rels, _ := f.store.ListReleases(ctx, app.ID)
 	if len(rels) != 2 || rels[0].Status != store.StatusSuperseded || rels[1].Status != store.StatusLive {
 		t.Errorf("releases = %+v", rels)
+	}
+}
+
+func TestOldInstanceIsStoppedAfterTheDrain(t *testing.T) {
+	f := newFixture(t, Config{DrainGrace: 300 * time.Millisecond})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// The push has returned and the route has moved, but the old instance
+	// is still up for requests already on their way to it.
+	if addr, _ := f.router.Get("hello.localhost"); addr != "127.0.0.1:"+strconv.Itoa(f.runtime.started[1].HostPort) {
+		t.Errorf("route %s is not the new instance", addr)
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 0 {
+		t.Fatalf("old instance stopped before the drain: %v", got)
+	}
+	start := time.Now()
+	f.waitStopped(t, 1)
+	if since := time.Since(start); since < 200*time.Millisecond {
+		t.Errorf("old instance stopped %v after the swap, want about 300ms", since)
+	}
+}
+
+func TestShutdownStopsADrainingInstanceAtOnce(t *testing.T) {
+	f := newFixture(t, Config{DrainGrace: time.Hour})
+	ctx := context.Background()
+	for range 2 {
+		if _, err := f.deploy(ctx, "hello"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 0 {
+		t.Fatalf("stopped %v before shutdown", got)
+	}
+	f.cancel()
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return; the drain held it")
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 1 || got[0] != "inst1" {
+		t.Errorf("stopped %v after shutdown, want the replaced instance", got)
 	}
 }
 
@@ -664,7 +727,7 @@ func TestRedeployRunsLiveImageWithNewConfig(t *testing.T) {
 	if len(f.runtime.started) != 2 || f.runtime.started[1].Image != "ashore/hello:abc1234" || f.runtime.started[1].Env["GREETING"] != "hi" || f.runtime.started[1].Release != "v2" {
 		t.Errorf("second instance = %+v", f.runtime.started)
 	}
-	if got := f.runtime.stoppedIDs(); len(got) != 1 || got[0] != "inst1" {
+	if got := f.waitStopped(t, 1); len(got) != 1 || got[0] != "inst1" {
 		t.Errorf("stopped %v, want the first instance", got)
 	}
 	rels, _ := f.store.ListReleases(ctx, app.ID)
@@ -739,6 +802,7 @@ func TestManifestShapesTheInstance(t *testing.T) {
 	if f.runtime.started[1].Memory != 128<<20 {
 		t.Errorf("redeployed instance memory = %d", f.runtime.started[1].Memory)
 	}
+	f.waitStopped(t, 1)
 	f.runtime.mu.Lock()
 	grace := f.runtime.graces["inst1"]
 	f.runtime.mu.Unlock()
@@ -764,6 +828,7 @@ func TestNoManifestMeansDefaults(t *testing.T) {
 	if _, err := f.deploy(context.Background(), "hello"); err != nil {
 		t.Fatal(err)
 	}
+	f.waitStopped(t, 1)
 	f.runtime.mu.Lock()
 	defer f.runtime.mu.Unlock()
 	if f.runtime.graces["inst1"] != 7*time.Second {
