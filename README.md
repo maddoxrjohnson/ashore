@@ -22,8 +22,10 @@ a copy-on-write table, so requests never take a lock, and every response carries
 variables: each release snapshots them when it is created, and changing one makes a new
 release of the same image and redeploys it. A deploy drops no requests: the new instance
 gets traffic only after its health check passes, the route moves in one atomic swap, and
-the old instance keeps running for a drain period before it is stopped. Crash restarts, the
-CLI, and restoring routes after a daemon restart are next.
+the old instance keeps running for a drain period before it is stopped. An instance that
+exits on its own is restarted with exponential backoff (1, 2, 4, up to 60 seconds) and
+given up on after ten failures in ten minutes, which `ps` reports. The CLI and restoring
+routes after a daemon restart are next.
 
 ## Zero-downtime deploys, measured
 
@@ -47,6 +49,19 @@ after the five-second drain. To reproduce:
 `ASHORE_DRAIN_GRACE` (default `5s`) is how long a replaced instance keeps running after the
 route moved away from it. The app's own `[process] grace` is the SIGTERM-to-SIGKILL window
 once the stop begins.
+
+## Crashes
+
+A watcher per instance waits for its process to exit. An exit the daemon did not ask for
+schedules a restart of the same release after 1 s, then 2, 4, 8, 16, 32, and 60 s for later
+failures within a ten-minute window; the tenth failure in the window marks the app
+`crashed` and nothing more is tried until a restart is asked for. The route stays where it
+was, so requests to a crashed app get a 502 with a request id rather than a 404.
+`examples/crasher` exits two seconds after it starts when `CRASH_AFTER=2s` is set, and
+
+    curl -H "Authorization: Bearer $(cat data/admin.token)" http://127.0.0.1:9000/api/v1/apps/crasher/ps
+
+shows the state, the restart count, and when the next attempt is due.
 
 An optional `ashore.toml` at the root of the repository tunes the deploy. Every value is
 optional; this is the full set with the defaults:

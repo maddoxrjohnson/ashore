@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/store"
+	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
 
 // Store is the slice of the database the API reads and writes.
@@ -30,9 +31,12 @@ type Store interface {
 	LiveRelease(ctx context.Context, appID int64) (store.Release, error)
 }
 
-// Supervisor is what the API asks the deploy machinery to do.
+// Supervisor is what the API asks the deploy machinery to do and to report.
 type Supervisor interface {
 	Redeploy(ctx context.Context, app, note string, out io.Writer) error
+	// Status is the app's instance as the supervisor sees it; ok is false
+	// when it has never started one since the daemon came up.
+	Status(app string) (st supervisor.Status, ok bool)
 }
 
 const (
@@ -60,6 +64,7 @@ func New(st Store, sup Supervisor, token string, log *slog.Logger) *Server {
 	s := &Server{store: st, sup: sup, token: []byte(token), log: log, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/config", s.getConfig)
 	s.mux.HandleFunc("PATCH /api/v1/apps/{app}/config", s.updateConfig)
+	s.mux.HandleFunc("GET /api/v1/apps/{app}/ps", s.ps)
 	return s
 }
 
@@ -206,6 +211,29 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.done()
+}
+
+// PS is the answer to GET .../ps: the app's instances. One per app today;
+// a list so that scaling out does not change the shape.
+type PS struct {
+	App       string              `json:"app"`
+	Instances []supervisor.Status `json:"instances"`
+}
+
+// ps reports the app's instance. An app that exists but has nothing
+// running since the daemon started answers with an empty list, not a 404:
+// "no instances" is a true statement about a real app.
+func (s *Server) ps(w http.ResponseWriter, r *http.Request) {
+	app, err := s.store.GetApp(r.Context(), r.PathValue("app"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := PS{App: app.Name, Instances: []supervisor.Status{}}
+	if st, ok := s.sup.Status(app.Name); ok {
+		out.Instances = append(out.Instances, st)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // fail maps a store error to a status. Anything unexpected is a 500 with a

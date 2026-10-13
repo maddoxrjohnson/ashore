@@ -85,11 +85,14 @@ type fakeRuntime struct {
 	stopped   []string
 	graces    map[string]time.Duration // id -> grace given to Stop
 	listeners map[string]net.Listener
+	gone      map[string]chan struct{} // closed when the instance's process has ended
+	codes     map[string]int           // its exit code
 	n         int
 }
 
 func newFakeRuntime(t *testing.T) *fakeRuntime {
-	rt := &fakeRuntime{listen: true, exitCode: -1, listeners: make(map[string]net.Listener), graces: make(map[string]time.Duration)}
+	rt := &fakeRuntime{listen: true, exitCode: -1, listeners: make(map[string]net.Listener), graces: make(map[string]time.Duration),
+		gone: make(map[string]chan struct{}), codes: make(map[string]int)}
 	t.Cleanup(func() {
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
@@ -123,24 +126,66 @@ func (r *fakeRuntime) Start(_ context.Context, s runtime.Spec) (runtime.Instance
 	return runtime.Instance{ID: id, App: s.App, Release: s.Release, Addr: addr, StartedAt: time.Now(), Running: true}, nil
 }
 
+// Stop records the call and ends the process, as docker stop would, so a
+// watcher waiting on it returns.
 func (r *fakeRuntime) Stop(_ context.Context, id string, grace time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopped = append(r.stopped, id)
 	r.graces[id] = grace
+	r.end(id, 143) // 128 + SIGTERM
+	return nil
+}
+
+// exit makes a running instance die on its own with code, the way a
+// crashing app does.
+func (r *fakeRuntime) exit(id string, code int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.end(id, code)
+}
+
+// end closes the instance's listener and releases its waiters. Idempotent.
+func (r *fakeRuntime) end(id string, code int) {
 	if l, ok := r.listeners[id]; ok {
 		_ = l.Close()
 		delete(r.listeners, id)
 	}
-	return nil
+	ch := r.goneChan(id)
+	select {
+	case <-ch:
+	default:
+		r.codes[id] = code
+		close(ch)
+	}
 }
 
-func (r *fakeRuntime) Wait(ctx context.Context, _ string) (int, error) {
+func (r *fakeRuntime) goneChan(id string) chan struct{} {
+	ch, ok := r.gone[id]
+	if !ok {
+		ch = make(chan struct{})
+		r.gone[id] = ch
+	}
+	return ch
+}
+
+// Wait returns at once for an instance configured to exit on start, or
+// blocks until exit or Stop ends it, or ctx ends.
+func (r *fakeRuntime) Wait(ctx context.Context, id string) (int, error) {
 	if !r.listen && r.exitCode >= 0 {
 		return r.exitCode, nil
 	}
-	<-ctx.Done()
-	return -1, ctx.Err()
+	r.mu.Lock()
+	ch := r.goneChan(id)
+	r.mu.Unlock()
+	select {
+	case <-ch:
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.codes[id], nil
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
 }
 
 func (r *fakeRuntime) Logs(_ context.Context, _ string, _ time.Time, stdout, _ io.Writer) error {
@@ -152,21 +197,23 @@ func (r *fakeRuntime) List(context.Context) ([]runtime.Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []runtime.Instance
-	for i := range r.started {
+	for i, spec := range r.started {
 		id := "inst" + strconv.Itoa(i+1)
-		_, running := r.listeners[id]
-		out = append(out, runtime.Instance{ID: id, Running: running || (r.listen && !slicesContains(r.stopped, id))})
+		running := true
+		if ch, ok := r.gone[id]; ok {
+			select {
+			case <-ch:
+				running = false
+			default:
+			}
+		}
+		if !r.listen && r.exitCode >= 0 {
+			running = false
+		}
+		out = append(out, runtime.Instance{ID: id, App: spec.App, Release: spec.Release,
+			Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(spec.HostPort)), Running: running})
 	}
 	return out, nil
-}
-
-func slicesContains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (r *fakeRuntime) stoppedIDs() []string {
@@ -199,6 +246,7 @@ type fixture struct {
 	builder *fakeBuilder
 	runtime *fakeRuntime
 	router  *router.Router
+	clock   *fakeClock
 	cancel  context.CancelFunc
 	done    chan struct{}
 }
@@ -223,8 +271,9 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	}
 	cfg.DataDir, cfg.Domain, cfg.HTTPPort = t.TempDir(), "localhost", 8080
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), done: make(chan struct{})}
+	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
 	f.sup = New(st, f.builder, f.runtime, f.router, cfg, log)
+	f.sup.clock = f.clock
 	// No repository exists here; a push sees no ashore.toml unless a test
 	// calls withManifest.
 	f.sup.readManifest = func(context.Context, string, string, string) ([]byte, bool, error) { return nil, false, nil }
@@ -747,6 +796,205 @@ func TestRedeployNeedsALiveRelease(t *testing.T) {
 	app, _ := f.store.GetApp(context.Background(), "hello")
 	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 0 {
 		t.Errorf("a refused redeploy created %+v", rels)
+	}
+}
+
+// waitState polls until the app's status has the state (and, when given, a
+// different instance than before), or fails after a few seconds.
+func (f *fixture) waitState(t *testing.T, state, notInstance string) Status {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, ok := f.sup.Status("hello")
+		if ok && st.State == state && st.Instance != notInstance {
+			return st
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %+v, want state %s (instance not %q)", st, state, notInstance)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestBackoffSchedule(t *testing.T) {
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 60 * time.Second, 60 * time.Second, 60 * time.Second, 60 * time.Second}
+	for i, w := range want {
+		if got := backoff(i + 1); got != w {
+			t.Errorf("backoff(%d) = %s, want %s", i+1, got, w)
+		}
+	}
+	if backoff(0) != time.Second {
+		t.Errorf("backoff(0) = %s", backoff(0))
+	}
+}
+
+func TestCrashLoopBacksOffThenGivesUp(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	if st.Release != "v1" || st.Instance != "inst1" || st.Restarts != 0 {
+		t.Fatalf("status after deploy = %+v", st)
+	}
+	app, _ := f.store.GetApp(ctx, "hello")
+
+	var waits []time.Duration
+	for i := 1; i <= 9; i++ {
+		prev := st.Instance
+		f.runtime.exit(prev, 1)
+		st = f.waitState(t, StateRestarting, "")
+		if !strings.Contains(st.Detail, "exited with code 1") || !strings.Contains(st.Detail, fmt.Sprintf("restart %d in", i)) {
+			t.Errorf("restarting detail = %q", st.Detail)
+		}
+		waits = append(waits, f.clock.fire(t))
+		st = f.waitState(t, StateRunning, prev)
+		if st.Restarts != i || st.Release != "v1" {
+			t.Errorf("after restart %d: %+v", i, st)
+		}
+		// The route follows the restarted instance; no new release is made.
+		if addr, _ := f.router.Get("hello.localhost"); addr != st.Addr {
+			t.Errorf("route %s, instance %s", addr, st.Addr)
+		}
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 60 * time.Second, 60 * time.Second, 60 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		t.Errorf("backoff waits = %v, want %v", waits, want)
+	}
+
+	// The tenth failure inside the window is the end of the line.
+	last := st
+	f.runtime.exit(last.Instance, 1)
+	st = f.waitState(t, StateCrashed, "")
+	if !strings.Contains(st.Detail, "10 failures") || st.Restarts != 9 || f.clock.pending() {
+		t.Errorf("crashed status = %+v, pending timer %v", st, f.clock.pending())
+	}
+	// The route still points at the dead instance: 502s, not 404s.
+	if addr, ok := f.router.Get("hello.localhost"); !ok || addr != last.Addr {
+		t.Errorf("route after crash = %s, %v; want %s", addr, ok, last.Addr)
+	}
+	if rels, _ := f.store.ListReleases(ctx, app.ID); len(rels) != 1 || rels[0].Status != store.StatusLive {
+		t.Errorf("releases after a crash loop = %+v, want v1 still live", rels)
+	}
+	// Every dead instance was removed; ten were started in all.
+	if len(f.runtime.started) != 10 || len(f.runtime.stoppedIDs()) != 10 {
+		t.Errorf("%d started, %d stopped, want 10 and 10", len(f.runtime.started), len(f.runtime.stoppedIDs()))
+	}
+}
+
+func TestFailureWindowForgetsOldCrashes(t *testing.T) {
+	f := newFixture(t, Config{})
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	f.runtime.exit(st.Instance, 2)
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("first wait %s", d)
+	}
+	st = f.waitState(t, StateRunning, st.Instance)
+
+	// Eleven quiet minutes later a crash is the first one again.
+	f.clock.advance(11 * time.Minute)
+	f.runtime.exit(st.Instance, 2)
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("wait after a quiet window %s, want 1s", d)
+	}
+	f.waitState(t, StateRunning, st.Instance)
+}
+
+func TestFailedRestartCountsAsAFailure(t *testing.T) {
+	f := newFixture(t, Config{HealthTimeout: 300 * time.Millisecond})
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	// From now on new instances never listen, so the restart's health check
+	// times out.
+	f.runtime.mu.Lock()
+	f.runtime.listen = false
+	f.runtime.mu.Unlock()
+	f.runtime.exit(st.Instance, 1)
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("first wait %s", d)
+	}
+	// The dead instance stays the current one (the route still points at
+	// it), so the status is told apart by its detail.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(st.Detail, "restart failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %+v, want a failed restart", st)
+		}
+		time.Sleep(5 * time.Millisecond)
+		st, _ = f.sup.Status("hello")
+	}
+	if st.State != StateRestarting || !strings.Contains(st.Detail, "did not accept connections") || !strings.Contains(st.Detail, "restart 2 in 2s") {
+		t.Errorf("status after a failed restart = %+v", st)
+	}
+	if st.Restarts != 0 || st.Instance != "inst1" {
+		t.Errorf("a failed restart counted as a restart or replaced the instance: %+v", st)
+	}
+	if d := f.clock.fire(t); d != 2*time.Second {
+		t.Errorf("second wait %s, want 2s", d)
+	}
+}
+
+func TestNewDeployCancelsAPendingRestart(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	f.runtime.exit(st.Instance, 1)
+	f.waitState(t, StateRestarting, "")
+	// A push arrives while the restart is pending.
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st = f.waitState(t, StateRunning, st.Instance)
+	if st.Release != "v2" || st.Restarts != 0 {
+		t.Errorf("after the push: %+v", st)
+	}
+	// The old timer fires into the void: nothing restarts, nothing starts.
+	f.clock.fire(t)
+	time.Sleep(50 * time.Millisecond)
+	if again, _ := f.sup.Status("hello"); again != st || len(f.runtime.started) != 2 {
+		t.Errorf("stale timer did something: %+v, %d started", again, len(f.runtime.started))
+	}
+	// And the new release's first crash waits 1s: the history was reset.
+	f.runtime.exit(st.Instance, 1)
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("first crash of a new release waited %s", d)
+	}
+}
+
+func TestReplacedInstanceExitIsNotAFailure(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	for range 2 {
+		if _, err := f.deploy(ctx, "hello"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.waitStopped(t, 1) // retire stopped inst1, whose watcher reported the exit
+	time.Sleep(50 * time.Millisecond)
+	st, _ := f.sup.Status("hello")
+	if st.State != StateRunning || st.Instance != "inst2" || st.Restarts != 0 || f.clock.pending() {
+		t.Errorf("status after a swap = %+v, pending %v", st, f.clock.pending())
+	}
+}
+
+func TestStatusBeforeAnything(t *testing.T) {
+	f := newFixture(t, Config{})
+	if _, ok := f.sup.Status("hello"); ok {
+		t.Error("status for an app nothing ran for")
+	}
+	f.builder.err = errors.New("no Dockerfile")
+	_, _ = f.deploy(context.Background(), "hello")
+	if _, ok := f.sup.Status("hello"); ok {
+		t.Error("status after a deploy that never started an instance")
 	}
 }
 

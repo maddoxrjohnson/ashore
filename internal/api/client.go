@@ -28,6 +28,13 @@ func (c *Client) Config(ctx context.Context, app string) (map[string]string, err
 	return vars, err
 }
 
+// PS returns the app's instances.
+func (c *Client) PS(ctx context.Context, app string) (PS, error) {
+	var out PS
+	err := c.getJSON(ctx, "/api/v1/apps/"+app+"/ps", &out)
+	return out, err
+}
+
 // UpdateConfig applies change and copies the redeploy's progress lines to
 // out. The error is the deploy's, when it failed.
 func (c *Client) UpdateConfig(ctx context.Context, app string, change ConfigChange, out io.Writer) error {

@@ -19,6 +19,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/config"
 	"github.com/maddoxrjohnson/ashore/internal/store"
+	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
 
 func TestAdmin(t *testing.T) {
@@ -171,6 +172,8 @@ type redeployer struct{}
 func (redeployer) Redeploy(context.Context, string, string, io.Writer) error {
 	return errors.New("unexpected redeploy")
 }
+
+func (redeployer) Status(string) (supervisor.Status, bool) { return supervisor.Status{}, false }
 
 func TestPortOf(t *testing.T) {
 	for in, want := range map[string]int{":8080": 8080, "127.0.0.1:80": 80, "nope": 0} {

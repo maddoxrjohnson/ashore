@@ -15,18 +15,26 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/store"
+	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
 
 const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 // fakeSup records redeploys and answers with a few lines, or an error.
 type fakeSup struct {
-	err error
+	err    error
+	status map[string]supervisor.Status
 
 	mu    sync.Mutex
 	calls []string // "app: note"
+}
+
+func (f *fakeSup) Status(app string) (supervisor.Status, bool) {
+	st, ok := f.status[app]
+	return st, ok
 }
 
 func (f *fakeSup) Redeploy(_ context.Context, app, note string, out io.Writer) error {
@@ -245,6 +253,35 @@ func TestConfigErrors(t *testing.T) {
 	}
 	if vars, _ := f.client.Config(ctx, "hello"); vars["A"] != "1" {
 		t.Errorf("config after a failed redeploy = %v", vars)
+	}
+}
+
+func TestPS(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	ps, err := f.client.PS(ctx, "hello")
+	if err != nil || ps.App != "hello" || len(ps.Instances) != 0 {
+		t.Errorf("ps with nothing running = %+v, %v", ps, err)
+	}
+	if _, err := f.client.PS(ctx, "nope"); !errors.Is(err, &Error{Status: http.StatusNotFound}) {
+		t.Errorf("ps unknown app: %v", err)
+	}
+	started := time.Date(2026, 10, 12, 23, 0, 0, 0, time.UTC)
+	f.sup.status = map[string]supervisor.Status{"hello": {
+		App: "hello", Release: "v3", Instance: "abc123", Addr: "127.0.0.1:41000",
+		State: supervisor.StateRestarting, Restarts: 2, StartedAt: started, Detail: "exited with code 1; restart 3 in 4s",
+	}}
+	ps, err = f.client.PS(ctx, "hello")
+	if err != nil || len(ps.Instances) != 1 || ps.Instances[0] != f.sup.status["hello"] {
+		t.Errorf("ps = %+v, %v", ps, err)
+	}
+	// The JSON shape the dashboard will read.
+	resp := f.raw(t, http.MethodGet, "/api/v1/apps/hello/ps", "Bearer "+token, "")
+	body, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{`"state":"restarting"`, `"restarts":2`, `"started_at":"2026-10-12T23:00:00Z"`, `"instances":[`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("ps body lacks %s:\n%s", want, body)
+		}
 	}
 }
 
