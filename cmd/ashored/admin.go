@@ -8,12 +8,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/config"
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/store"
@@ -27,9 +29,15 @@ const adminUsage = `usage:
   ashored apps create <name>            create an app and its repository
   ashored keys add <name> <pubkey>      allow a public key file to push
   ashored releases list <app>           list an app's releases, newest first
-  ashored releases info <app> <vN>      show one release`
+  ashored releases info <app> <vN>      show one release
+  ashored config get <app>              show config vars
+  ashored config set <app> K=V ...      set config vars and redeploy (daemon must be running)
+  ashored config unset <app> K ...      unset config vars and redeploy`
 
-var errUsage = errors.New(adminUsage)
+var (
+	errUsage   = errors.New(adminUsage)
+	errNotPair = errors.New("expected KEY=value")
+)
 
 func admin(ctx context.Context, cfg config.Config, args []string, out io.Writer) error {
 	if len(args) < 2 {
@@ -65,8 +73,87 @@ func admin(ctx context.Context, cfg config.Config, args []string, out io.Writer)
 			return errUsage
 		}
 		return releaseInfo(ctx, st, args[2], args[3], out)
+	case "config get":
+		if len(args) != 3 {
+			return errUsage
+		}
+		return configGet(ctx, cfg, args[2], out)
+	case "config set":
+		if len(args) < 4 {
+			return errUsage
+		}
+		return configSet(ctx, cfg, args[2], args[3:], out)
+	case "config unset":
+		if len(args) < 4 {
+			return errUsage
+		}
+		return configUnset(ctx, cfg, args[2], args[3:], out)
 	}
 	return errUsage
+}
+
+// apiClient talks to the running daemon with the token it wrote. Config
+// changes have to go through the daemon because it owns the deploy.
+func apiClient(cfg config.Config) (*api.Client, error) {
+	token, err := api.ReadToken(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := net.SplitHostPort(cfg.InternalAddr)
+	if err != nil {
+		return nil, fmt.Errorf("ASHORE_INTERNAL_ADDR: %w", err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return &api.Client{URL: "http://" + net.JoinHostPort(host, port), Token: token}, nil
+}
+
+// configGet prints KEY=value lines, sorted, the way a shell would show them.
+func configGet(ctx context.Context, cfg config.Config, app string, out io.Writer) error {
+	c, err := apiClient(cfg)
+	if err != nil {
+		return err
+	}
+	vars, err := c.Config(ctx, app)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		_, _ = fmt.Fprintf(out, "%s=%s\n", k, vars[k])
+	}
+	return nil
+}
+
+// configSet parses KEY=value arguments; the value may be empty or contain
+// more '=' signs.
+func configSet(ctx context.Context, cfg config.Config, app string, pairs []string, out io.Writer) error {
+	set := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || k == "" {
+			return fmt.Errorf("%w: %q", errNotPair, p)
+		}
+		set[k] = v
+	}
+	c, err := apiClient(cfg)
+	if err != nil {
+		return err
+	}
+	return c.UpdateConfig(ctx, app, api.ConfigChange{Set: set}, out)
+}
+
+func configUnset(ctx context.Context, cfg config.Config, app string, keys []string, out io.Writer) error {
+	c, err := apiClient(cfg)
+	if err != nil {
+		return err
+	}
+	return c.UpdateConfig(ctx, app, api.ConfigChange{Unset: keys}, out)
 }
 
 // createApp inserts the row, then creates the bare repository. A repository

@@ -17,6 +17,7 @@ import (
 	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/builder"
 	"github.com/maddoxrjohnson/ashore/internal/config"
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
@@ -94,6 +95,14 @@ func run() error {
 			StopGrace:        cfg.StopGrace,
 		}, slog.Default())
 
+	// The admin token is created on the first run; the CLI and the admin
+	// subcommands read the file.
+	token, err := api.LoadToken(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	as := api.New(st, sup, token, slog.Default())
+
 	hs, err := hook.NewServer(cfg.DataDir, sup)
 	if err != nil {
 		return err
@@ -118,6 +127,13 @@ func run() error {
 		_ = sln.Close()
 		return fmt.Errorf("http listen: %w", err)
 	}
+	apiLn, err := net.Listen("tcp", cfg.InternalAddr)
+	if err != nil {
+		_ = hln.Close()
+		_ = sln.Close()
+		_ = httpLn.Close()
+		return fmt.Errorf("internal listen: %w", err)
+	}
 
 	// Each Serve returns nil once its context ends and closes its listener
 	// on the way out. The group cancels that context on the first failure,
@@ -126,6 +142,7 @@ func run() error {
 	g.Go(func() error { return hs.Serve(gctx, hln) })
 	g.Go(func() error { return gs.Serve(gctx, sln) })
 	g.Go(func() error { return rt.Serve(gctx, httpLn) })
+	g.Go(func() error { return as.Serve(gctx, apiLn) })
 	g.Go(func() error { return sup.Run(gctx) })
 	g.Go(func() error {
 		<-gctx.Done()
@@ -135,6 +152,7 @@ func run() error {
 	slog.Info("hook socket", "path", hs.Socket())
 	slog.Info("ssh listening", "addr", sln.Addr().String())
 	slog.Info("http listening", "addr", httpLn.Addr().String(), "domain", cfg.Domain)
+	slog.Info("api listening", "addr", apiLn.Addr().String())
 	slog.Info("ready", "version", version)
 	return g.Wait()
 }

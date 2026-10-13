@@ -18,8 +18,10 @@ reverse proxy at it, stops the previous container, and marks the release live. E
 that streams back to the pusher's terminal; a build that fails or an app that never listens
 rejects the push and the previous release keeps serving. The proxy routes by hostname from
 a copy-on-write table, so requests never take a lock, and every response carries an
-`X-Request-Id` that also appears in the access log. Zero-downtime swaps, crash restarts,
-config vars, the CLI, and restoring routes after a daemon restart are next.
+`X-Request-Id` that also appears in the access log. Config vars are per-app environment
+variables: each release snapshots them when it is created, and changing one makes a new
+release of the same image and redeploys it. Zero-downtime swaps, crash restarts, the CLI,
+and restoring routes after a daemon restart are next.
 
 ## Deploying an app locally
 
@@ -39,12 +41,30 @@ Change the string in `main.go`, commit, push again, and curl shows the new one. 
 `./bin/ashored releases list hello` shows the history, the rejected push included as a
 `failed` release; `releases info hello v2` shows one release's image, commit, and config.
 
+Config vars are set through the daemon, which redeploys the live release with the new
+environment and streams the deploy to your terminal:
+
+    ./bin/ashored config set hello GREETING=hi      # release v3, same image, new env
+    ./bin/ashored config get hello                  # GREETING=hi
+    ./bin/ashored config unset hello GREETING       # release v4
+
+`examples/config-reader` answers every request with `$GREETING`, so a curl after each
+command shows the change. The daemon sets `PORT` itself and refuses it as a config var.
+Values are never written to the daemon's log; `releases info` shows the snapshot a release
+ran with.
+
+The daemon's own API listens on `ASHORE_INTERNAL_ADDR` (default `127.0.0.1:9000`) and
+requires the admin token it writes to `data/admin.token` on first start, as a bearer
+token. The admin subcommands read that file; the `ashore` CLI will do the same over the
+network.
+
 The build context is `git archive` of the pushed commit, so only tracked files reach the
 build and `.dockerignore` has no effect. To keep tracked files out of the image, mark them
 `export-ignore` in `.gitattributes`.
 
-The admin subcommands (`apps create`, `keys add`, `releases list`, `releases info`) are a
-stopgap until the HTTP API and the `ashore` CLI exist. A daemon restart does not yet re-attach the containers it started;
+The admin subcommands (`apps create`, `keys add`, `releases list`, `releases info`,
+`config get/set/unset`) are a stopgap until the `ashore` CLI exists. A daemon restart does
+not yet re-attach the containers it started;
 until reconciliation lands, `docker ps --filter label=ashore.app` shows what is running.
 
 ## Build and run

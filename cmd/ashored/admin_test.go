@@ -6,6 +6,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/config"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
@@ -39,6 +43,21 @@ func TestAdmin(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Config commands go through the API of a running daemon; here that is
+	// a test server over the same database, with the token file written
+	// where the daemon would have left it.
+	apiStore, err := store.Open(ctx, filepath.Join(cfg.DataDir, "ashore.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = apiStore.Close() }()
+	srv := httptest.NewServer(api.New(apiStore, redeployer{}, "tok", slog.New(slog.NewTextHandler(io.Discard, nil))))
+	defer srv.Close()
+	cfg.InternalAddr = strings.TrimPrefix(srv.URL, "http://")
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, api.TokenFile), []byte("tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	cases := []struct {
 		name string
 		args []string
@@ -57,6 +76,13 @@ func TestAdmin(t *testing.T) {
 		{"list unknown app", []string{"releases", "list", "nope"}, "", store.ErrNotFound},
 		{"info no release", []string{"releases", "info", "hello", "v1"}, "", store.ErrNotFound},
 		{"info bad args", []string{"releases", "info", "hello"}, "", errUsage},
+		{"config get empty", []string{"config", "get", "hello"}, "", nil},
+		{"config set", []string{"config", "set", "hello", "GREETING=hi there", "EMPTY="}, "nothing is running yet", nil},
+		{"config get", []string{"config", "get", "hello"}, "EMPTY=\nGREETING=hi there\n", nil},
+		{"config set bad pair", []string{"config", "set", "hello", "NOEQUALS"}, "", errNotPair},
+		{"config unset", []string{"config", "unset", "hello", "EMPTY"}, "nothing is running yet", nil},
+		{"config unset unknown app", []string{"config", "unset", "nope", "X"}, "", errAPI},
+		{"config bad args", []string{"config", "set", "hello"}, "", errUsage},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -130,6 +156,17 @@ func TestAdmin(t *testing.T) {
 	if err := admin(ctx, cfg, []string{"releases", "info", "hello", "2"}, &out); err == nil || !strings.Contains(err.Error(), "not a release version") {
 		t.Errorf("bad version: err = %v", err)
 	}
+}
+
+// errAPI matches any error the daemon answered with.
+var errAPI = &api.Error{}
+
+// redeployer is the API's supervisor in TestAdmin; no app is live there,
+// so it is never called.
+type redeployer struct{}
+
+func (redeployer) Redeploy(context.Context, string, string, io.Writer) error {
+	return errors.New("unexpected redeploy")
 }
 
 func TestPortOf(t *testing.T) {
