@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,16 +78,18 @@ type fakeRuntime struct {
 	exitCode int // used when listen is false and >= 0
 	startErr error
 	logs     string
+	handler  http.Handler // when set, each instance serves HTTP with it
 
 	mu        sync.Mutex
 	started   []runtime.Spec
 	stopped   []string
+	graces    map[string]time.Duration // id -> grace given to Stop
 	listeners map[string]net.Listener
 	n         int
 }
 
 func newFakeRuntime(t *testing.T) *fakeRuntime {
-	rt := &fakeRuntime{listen: true, exitCode: -1, listeners: make(map[string]net.Listener)}
+	rt := &fakeRuntime{listen: true, exitCode: -1, listeners: make(map[string]net.Listener), graces: make(map[string]time.Duration)}
 	t.Cleanup(func() {
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
@@ -110,15 +115,19 @@ func (r *fakeRuntime) Start(_ context.Context, s runtime.Spec) (runtime.Instance
 			return runtime.Instance{}, err
 		}
 		r.listeners[id] = l
+		if r.handler != nil {
+			go func() { _ = http.Serve(l, r.handler) }()
+		}
 	}
 	r.started = append(r.started, s)
 	return runtime.Instance{ID: id, App: s.App, Release: s.Release, Addr: addr, StartedAt: time.Now(), Running: true}, nil
 }
 
-func (r *fakeRuntime) Stop(_ context.Context, id string, _ time.Duration) error {
+func (r *fakeRuntime) Stop(_ context.Context, id string, grace time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopped = append(r.stopped, id)
+	r.graces[id] = grace
 	if l, ok := r.listeners[id]; ok {
 		_ = l.Close()
 		delete(r.listeners, id)
@@ -209,10 +218,16 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	if cfg.HealthTimeout == 0 {
 		cfg.HealthTimeout = 5 * time.Second
 	}
+	if cfg.StopGrace == 0 {
+		cfg.StopGrace = 10 * time.Second
+	}
 	cfg.DataDir, cfg.Domain, cfg.HTTPPort = t.TempDir(), "localhost", 8080
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), done: make(chan struct{})}
 	f.sup = New(st, f.builder, f.runtime, f.router, cfg, log)
+	// No repository exists here; a push sees no ashore.toml unless a test
+	// calls withManifest.
+	f.sup.readManifest = func(context.Context, string, string, string) ([]byte, bool, error) { return nil, false, nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
 	go func() {
@@ -545,7 +560,7 @@ func TestListening(t *testing.T) {
 	}
 	dead := closed.Addr().String()
 	_ = closed.Close()
-	if listening(ctx, dead) {
+	if listening(ctx, dead, healthEvery) {
 		t.Error("a closed port counts as listening")
 	}
 
@@ -564,7 +579,7 @@ func TestListening(t *testing.T) {
 			_ = c.Close()
 		}
 	}()
-	if listening(ctx, proxy.Addr().String()) {
+	if listening(ctx, proxy.Addr().String(), healthEvery) {
 		t.Error("a connection closed at once counts as listening")
 	}
 
@@ -574,7 +589,7 @@ func TestListening(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = held.Close() }()
-	if !listening(ctx, held.Addr().String()) {
+	if !listening(ctx, held.Addr().String(), healthEvery) {
 		t.Error("a held connection does not count as listening")
 	}
 
@@ -594,7 +609,7 @@ func TestListening(t *testing.T) {
 			_ = c.Close()
 		}
 	}()
-	if !listening(ctx, talker.Addr().String()) {
+	if !listening(ctx, talker.Addr().String(), healthEvery) {
 		t.Error("a server that sends a banner does not count as listening")
 	}
 }
@@ -669,5 +684,180 @@ func TestRedeployNeedsALiveRelease(t *testing.T) {
 	app, _ := f.store.GetApp(context.Background(), "hello")
 	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 0 {
 		t.Errorf("a refused redeploy created %+v", rels)
+	}
+}
+
+// withManifest makes every push see this ashore.toml.
+func (f *fixture) withManifest(toml string) {
+	f.sup.readManifest = func(context.Context, string, string, string) ([]byte, bool, error) {
+		return []byte(toml), true, nil
+	}
+}
+
+func TestManifestShapesTheInstance(t *testing.T) {
+	f := newFixture(t, Config{StopGrace: 10 * time.Second})
+	ctx := context.Background()
+	f.withManifest("[health]\npath = \"/healthz\"\ninterval = \"20ms\"\n[process]\nmemory = \"128m\"\ncpu = \"0.5\"\ngrace = \"3s\"\n")
+	f.runtime.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" && r.Host == "hello.localhost" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, "wrong probe: "+r.Host+r.URL.Path, http.StatusNotFound)
+	})
+	out, err := f.deploy(ctx, "hello")
+	if err != nil {
+		t.Fatalf("deploy: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"-----> ashore.toml: health GET /healthz (timeout 5s), memory 128m, cpu 0.5, grace 3s\n",
+		"-----> waiting for v1 to answer GET /healthz on port 8080\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	spec := f.runtime.started[0]
+	if spec.Memory != 128<<20 || spec.CPU != 0.5 {
+		t.Errorf("spec limits = %d bytes, %v cpu", spec.Memory, spec.CPU)
+	}
+	app, _ := f.store.GetApp(ctx, "hello")
+	rel, _ := f.store.LiveRelease(ctx, app.ID)
+	if !strings.Contains(rel.ManifestJSON, `"path":"/healthz"`) || !strings.Contains(rel.ManifestJSON, `"memory":"128m"`) {
+		t.Errorf("stored manifest = %s", rel.ManifestJSON)
+	}
+
+	// A redeploy carries the manifest over; the old instance is stopped
+	// with its own grace, not the daemon default.
+	var buf bytes.Buffer
+	if err := f.sup.Redeploy(ctx, "hello", "config:set X", &buf); err != nil {
+		t.Fatalf("redeploy: %v\n%s", err, buf.String())
+	}
+	if again, _ := f.store.LiveRelease(ctx, app.ID); again.ManifestJSON != rel.ManifestJSON {
+		t.Errorf("redeploy manifest = %s, want %s", again.ManifestJSON, rel.ManifestJSON)
+	}
+	if f.runtime.started[1].Memory != 128<<20 {
+		t.Errorf("redeployed instance memory = %d", f.runtime.started[1].Memory)
+	}
+	f.runtime.mu.Lock()
+	grace := f.runtime.graces["inst1"]
+	f.runtime.mu.Unlock()
+	if grace != 3*time.Second {
+		t.Errorf("old instance stopped with grace %v, want 3s", grace)
+	}
+}
+
+func TestNoManifestMeansDefaults(t *testing.T) {
+	f := newFixture(t, Config{StopGrace: 7 * time.Second})
+	out, err := f.deploy(context.Background(), "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "ashore.toml") {
+		t.Errorf("no manifest, but the output mentions one:\n%s", out)
+	}
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	rel, _ := f.store.LiveRelease(context.Background(), app.ID)
+	if !strings.Contains(rel.ManifestJSON, `"timeout":"5s"`) || !strings.Contains(rel.ManifestJSON, `"grace":"7s"`) || !strings.Contains(rel.ManifestJSON, `"memory":"256m"`) {
+		t.Errorf("stored defaults = %s", rel.ManifestJSON)
+	}
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	f.runtime.mu.Lock()
+	defer f.runtime.mu.Unlock()
+	if f.runtime.graces["inst1"] != 7*time.Second {
+		t.Errorf("default grace = %v, want 7s", f.runtime.graces["inst1"])
+	}
+}
+
+func TestBadManifestRejectsPushWithoutARelease(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.withManifest("[health]\npath = \"healthz\"\n")
+	_, err := f.deploy(context.Background(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "ashore.toml: health.path") {
+		t.Fatalf("err = %v", err)
+	}
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 0 {
+		t.Errorf("a bad manifest made a release: %+v", rels)
+	}
+	if len(f.runtime.started) != 0 || f.builder.maxSeen != 0 {
+		t.Error("a bad manifest built or started something")
+	}
+}
+
+func TestHTTPHealthWaitsForA2xx(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.withManifest("[health]\npath = \"/healthz\"\ninterval = \"20ms\"\n")
+	var probes atomic.Int32
+	f.runtime.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if probes.Add(1) <= 3 {
+			http.Error(w, "warming up", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	})
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if n := probes.Load(); n < 4 {
+		t.Errorf("%d probes; the deploy went live before a 2xx", n)
+	}
+	if _, ok := f.router.Get("hello.localhost"); !ok {
+		t.Error("no route after a healthy deploy")
+	}
+}
+
+func TestHTTPHealthTimeoutNamesTheLastAnswer(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.withManifest("[health]\npath = \"/healthz\"\ntimeout = \"300ms\"\ninterval = \"20ms\"\n")
+	f.runtime.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	})
+	_, err := f.deploy(context.Background(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "v1 did not answer 2xx on GET /healthz within 300ms (last: 500 Internal Server Error)") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := f.runtime.stoppedIDs(); len(got) != 1 {
+		t.Errorf("stopped %v, want the unhealthy instance", got)
+	}
+	if _, ok := f.router.Get("hello.localhost"); ok {
+		t.Error("route set for an unhealthy instance")
+	}
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	if rels, _ := f.store.ListReleases(context.Background(), app.ID); len(rels) != 1 || rels[0].Status != store.StatusFailed {
+		t.Errorf("releases = %+v, want one failed", rels)
+	}
+}
+
+func TestAnswers(t *testing.T) {
+	var gotHost string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		switch r.URL.Path {
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+		case "/redirect":
+			http.Redirect(w, r, "/ok", http.StatusFound)
+		default:
+			http.Error(w, "no", http.StatusTeapot)
+		}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ctx := context.Background()
+	if ok, detail := answers(ctx, addr, "app.localhost", "/ok"); !ok || detail != "200 OK" || gotHost != "app.localhost" {
+		t.Errorf("/ok: %v %q host %q", ok, detail, gotHost)
+	}
+	if ok, detail := answers(ctx, addr, "app.localhost", "/nope"); ok || detail != "418 I'm a teapot" {
+		t.Errorf("/nope: %v %q", ok, detail)
+	}
+	if ok, detail := answers(ctx, addr, "app.localhost", "/redirect"); ok || !strings.HasPrefix(detail, "302") {
+		t.Errorf("/redirect: %v %q", ok, detail)
+	}
+	srv.Close()
+	if ok, detail := answers(ctx, addr, "app.localhost", "/ok"); ok || detail == "" {
+		t.Errorf("closed server: %v %q", ok, detail)
 	}
 }

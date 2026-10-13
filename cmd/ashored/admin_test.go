@@ -148,8 +148,11 @@ func TestAdmin(t *testing.T) {
 	if err := admin(ctx, cfg, []string{"releases", "info", "hello", "v2"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"release: v2", "status:  live", "image:   ashore/hello:2222222", "commit:  2222222222222222222222222222222222222222", "note:    push 2222222", "config:  {}"} {
-		if !strings.Contains(out.String(), want) {
+	// Column widths follow the longest label, so compare with the padding
+	// collapsed.
+	info := strings.Join(strings.Fields(out.String()), " ")
+	for _, want := range []string{"release: v2", "status: live", "image: ashore/hello:2222222", "commit: 2222222222222222222222222222222222222222", "note: push 2222222", "config: {}", "manifest: {}"} {
+		if !strings.Contains(info, want) {
 			t.Errorf("releases info lacks %q:\n%s", want, out.String())
 		}
 	}

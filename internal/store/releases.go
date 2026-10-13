@@ -34,17 +34,20 @@ const (
 
 // Release is one immutable (image, config) pair of an app, numbered per app
 // from v1. Image is empty while the release is building. ConfigJSON is the
-// config vars as a JSON object of strings, frozen when the release is made.
+// config vars as a JSON object of strings, frozen when the release is made;
+// ManifestJSON is the effective ashore.toml the same way ({} before
+// manifests existed, which the manifest package reads as the defaults).
 type Release struct {
-	ID         int64
-	AppID      int64
-	Version    int
-	Image      string
-	GitSHA     string
-	ConfigJSON string
-	Status     string
-	Note       string
-	CreatedAt  time.Time
+	ID           int64
+	AppID        int64
+	Version      int
+	Image        string
+	GitSHA       string
+	ConfigJSON   string
+	ManifestJSON string
+	Status       string
+	Note         string
+	CreatedAt    time.Time
 }
 
 // Name is how a release is shown: v1, v2, ...
@@ -61,20 +64,22 @@ func ParseVersion(name string) (int, error) {
 
 // NewRelease is what is known about a release when it is created. An empty
 // Image means the build has not run yet; the release starts as building.
-// An empty ConfigJSON means no config vars.
+// An empty ConfigJSON means no config vars; an empty ManifestJSON means
+// the defaults.
 type NewRelease struct {
-	Image      string
-	GitSHA     string
-	ConfigJSON string
-	Note       string
+	Image        string
+	GitSHA       string
+	ConfigJSON   string
+	ManifestJSON string
+	Note         string
 }
 
-const releaseColumns = `id, app_id, version, image, COALESCE(git_sha, ''), config_json, status, note, created_at`
+const releaseColumns = `id, app_id, version, image, COALESCE(git_sha, ''), config_json, manifest_json, status, note, created_at`
 
 func scanRelease(sc scanner) (Release, error) {
 	var r Release
 	var created int64
-	if err := sc.Scan(&r.ID, &r.AppID, &r.Version, &r.Image, &r.GitSHA, &r.ConfigJSON, &r.Status, &r.Note, &created); err != nil {
+	if err := sc.Scan(&r.ID, &r.AppID, &r.Version, &r.Image, &r.GitSHA, &r.ConfigJSON, &r.ManifestJSON, &r.Status, &r.Note, &created); err != nil {
 		return Release{}, err
 	}
 	r.CreatedAt = time.Unix(created, 0).UTC()
@@ -92,21 +97,27 @@ func (s *Store) CreateRelease(ctx context.Context, appID int64, n NewRelease) (R
 	if !isStringObject(n.ConfigJSON) {
 		return Release{}, errors.New("create release: config must be a JSON object of strings")
 	}
+	if n.ManifestJSON == "" {
+		n.ManifestJSON = "{}"
+	}
+	if !json.Valid([]byte(n.ManifestJSON)) {
+		return Release{}, errors.New("create release: manifest must be JSON")
+	}
 	status := StatusStarting
 	if n.Image == "" {
 		status = StatusBuilding
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	r := Release{AppID: appID, Image: n.Image, GitSHA: n.GitSHA, ConfigJSON: n.ConfigJSON, Status: status, Note: n.Note, CreatedAt: now}
+	r := Release{AppID: appID, Image: n.Image, GitSHA: n.GitSHA, ConfigJSON: n.ConfigJSON, ManifestJSON: n.ManifestJSON, Status: status, Note: n.Note, CreatedAt: now}
 	var sha sql.NullString
 	if n.GitSHA != "" {
 		sha = sql.NullString{String: n.GitSHA, Valid: true}
 	}
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO releases (app_id, version, image, git_sha, config_json, status, note, created_at)
-		SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ? FROM releases WHERE app_id = ?
+		INSERT INTO releases (app_id, version, image, git_sha, config_json, manifest_json, status, note, created_at)
+		SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM releases WHERE app_id = ?
 		RETURNING id, version`,
-		appID, r.Image, sha, r.ConfigJSON, r.Status, r.Note, now.Unix(), appID).Scan(&r.ID, &r.Version)
+		appID, r.Image, sha, r.ConfigJSON, r.ManifestJSON, r.Status, r.Note, now.Unix(), appID).Scan(&r.ID, &r.Version)
 	if err != nil {
 		if isForeignKey(err) {
 			return Release{}, fmt.Errorf("app %d: %w", appID, ErrNotFound)

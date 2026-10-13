@@ -227,8 +227,8 @@ func listReleases(ctx context.Context, st *store.Store, name string, out io.Writ
 	return tw.Flush()
 }
 
-// releaseInfo prints everything recorded about one release. The config
-// snapshot is shown as stored; it is empty until config vars exist.
+// releaseInfo prints everything recorded about one release. The config and
+// manifest snapshots are shown as stored.
 func releaseInfo(ctx context.Context, st *store.Store, name, version string, out io.Writer) error {
 	app, err := st.GetApp(ctx, name)
 	if err != nil {
@@ -252,6 +252,7 @@ func releaseInfo(ctx context.Context, st *store.Store, name, version string, out
 		{"created", r.CreatedAt.Local().Format(time.DateTime)},
 		{"note", r.Note},
 		{"config", r.ConfigJSON},
+		{"manifest", r.ManifestJSON},
 	} {
 		_, _ = fmt.Fprintf(tw, "%s:\t%s\n", kv[0], kv[1])
 	}

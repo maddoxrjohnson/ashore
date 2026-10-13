@@ -23,6 +23,23 @@ variables: each release snapshots them when it is created, and changing one make
 release of the same image and redeploys it. Zero-downtime swaps, crash restarts, the CLI,
 and restoring routes after a daemon restart are next.
 
+An optional `ashore.toml` at the root of the repository tunes the deploy. Every value is
+optional; this is the full set with the defaults:
+
+    [health]
+    path = "/healthz"     # GET must return 2xx; without it, the check is a held TCP connection
+    timeout = "30s"       # how long a new instance has to pass the check
+    interval = "250ms"    # how often to probe
+
+    [process]
+    grace = "10s"         # SIGTERM to SIGKILL when an instance is stopped
+    memory = "256m"       # memory limit (k, m, g, or bytes)
+    cpu = "1.0"           # CPU quota
+
+The effective values are stored with each release, so a rollback or a config change runs
+with the settings of the release it reuses. A file that does not parse, or names a key the
+daemon does not know, rejects the push with the error as the last line.
+
 ## Deploying an app locally
 
 With Docker running and the daemon started (`make run`, text logs on stderr):
@@ -36,10 +53,12 @@ With Docker running and the daemon started (`make run`, text logs on stderr):
     curl http://hello.localhost:8080/
 
 The push prints `release v1`, the build steps, and `live at http://hello.localhost:8080`.
+With an `ashore.toml` in the repository the push also prints the settings it read.
 Change the string in `main.go`, commit, push again, and curl shows the new one. Break the
 `Dockerfile`, push, and the push is rejected while the old version keeps serving.
 `./bin/ashored releases list hello` shows the history, the rejected push included as a
-`failed` release; `releases info hello v2` shows one release's image, commit, and config.
+`failed` release; `releases info hello v2` shows one release's image, commit, config, and
+manifest.
 
 Config vars are set through the daemon, which redeploys the live release with the new
 environment and streams the deploy to your terminal:

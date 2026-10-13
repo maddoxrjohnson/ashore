@@ -37,7 +37,7 @@ func TestCreateReleaseNumbersPerApp(t *testing.T) {
 		t.Errorf("versions a=%d,%d b=%d, want 1,2 and 1", r1.Version, r2.Version, rb.Version)
 	}
 	// No image yet means the build has not run: building. With one: starting.
-	if r1.Status != StatusBuilding || r1.Image != "" || r1.ConfigJSON != "{}" || r1.Name() != "v1" {
+	if r1.Status != StatusBuilding || r1.Image != "" || r1.ConfigJSON != "{}" || r1.ManifestJSON != "{}" || r1.Name() != "v1" {
 		t.Errorf("release without image = %+v", r1)
 	}
 	if r2.Status != StatusStarting || r2.GitSHA != "" {
@@ -78,9 +78,12 @@ func TestCreateReleaseRejectsBadInput(t *testing.T) {
 			t.Errorf("config %q accepted", bad)
 		}
 	}
-	r := mustRelease(t, s, a.ID, NewRelease{ConfigJSON: `{"GREETING": "hi"}`})
-	if got, _ := s.GetRelease(ctx, r.ID); got.ConfigJSON != `{"GREETING": "hi"}` {
-		t.Errorf("config stored as %q", got.ConfigJSON)
+	if _, err := s.CreateRelease(ctx, a.ID, NewRelease{ManifestJSON: "not json"}); err == nil {
+		t.Error("bad manifest accepted")
+	}
+	r := mustRelease(t, s, a.ID, NewRelease{ConfigJSON: `{"GREETING": "hi"}`, ManifestJSON: `{"health":{"path":"/healthz"}}`})
+	if got, _ := s.GetRelease(ctx, r.ID); got.ConfigJSON != `{"GREETING": "hi"}` || got.ManifestJSON != `{"health":{"path":"/healthz"}}` {
+		t.Errorf("stored as %+v", got)
 	}
 	if r.Version != 1 {
 		t.Errorf("rejected releases consumed version numbers: got v%d", r.Version)
