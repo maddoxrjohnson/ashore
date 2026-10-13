@@ -34,6 +34,8 @@ type Store interface {
 // Supervisor is what the API asks the deploy machinery to do and to report.
 type Supervisor interface {
 	Redeploy(ctx context.Context, app, note string, out io.Writer) error
+	Rollback(ctx context.Context, app string, version int, out io.Writer) error
+	Restart(ctx context.Context, app string, out io.Writer) error
 	// Status is the app's instance as the supervisor sees it; ok is false
 	// when it has never started one since the daemon came up.
 	Status(app string) (st supervisor.Status, ok bool)
@@ -65,6 +67,8 @@ func New(st Store, sup Supervisor, token string, log *slog.Logger) *Server {
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/config", s.getConfig)
 	s.mux.HandleFunc("PATCH /api/v1/apps/{app}/config", s.updateConfig)
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/ps", s.ps)
+	s.mux.HandleFunc("POST /api/v1/apps/{app}/restart", s.restart)
+	s.mux.HandleFunc("POST /api/v1/apps/{app}/rollback", s.rollback)
 	return s
 }
 
@@ -207,6 +211,61 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	// written, and an abandoned redeploy would leave the running release
 	// disagreeing with it. The supervisor's own lifetime still bounds it.
 	if err := s.sup.Redeploy(context.WithoutCancel(r.Context()), app.Name, change.Note(), st); err != nil {
+		st.fail(err)
+		return
+	}
+	st.done()
+}
+
+// restart streams a restart of the app's live release.
+func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
+	app, err := s.store.GetApp(r.Context(), r.PathValue("app"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.stream(w, r, func(ctx context.Context, out io.Writer) error {
+		return s.sup.Restart(ctx, app.Name, out)
+	})
+}
+
+// RollbackRequest is the body of POST .../rollback.
+type RollbackRequest struct {
+	Version string `json:"version"` // "v3"
+}
+
+// rollback streams a rollback to the named release.
+func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
+	app, err := s.store.GetApp(r.Context(), r.PathValue("app"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	var req RollbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
+		return
+	}
+	version, err := store.ParseVersion(req.Version)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.stream(w, r, func(ctx context.Context, out io.Writer) error {
+		return s.sup.Rollback(ctx, app.Name, version, out)
+	})
+}
+
+// stream runs a long operation with its output as events and its error as
+// the final one. The operation gets a context the client cannot cancel: a
+// deploy half done is worse than one the client did not watch to the end.
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, op func(ctx context.Context, out io.Writer) error) {
+	st, err := newStream(w)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if err := op(context.WithoutCancel(r.Context()), st); err != nil {
 		st.fail(err)
 		return
 	}

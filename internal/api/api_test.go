@@ -32,6 +32,22 @@ type fakeSup struct {
 	calls []string // "app: note"
 }
 
+func (f *fakeSup) Restart(_ context.Context, app string, out io.Writer) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, app+": restart")
+	f.mu.Unlock()
+	_, _ = fmt.Fprintln(out, "-----> restarting v2")
+	return f.err
+}
+
+func (f *fakeSup) Rollback(_ context.Context, app string, version int, out io.Writer) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, fmt.Sprintf("%s: rollback v%d", app, version))
+	f.mu.Unlock()
+	_, _ = fmt.Fprintf(out, "-----> release v3 (rollback v%d)\n", version)
+	return f.err
+}
+
 func (f *fakeSup) Status(app string) (supervisor.Status, bool) {
 	st, ok := f.status[app]
 	return st, ok
@@ -282,6 +298,44 @@ func TestPS(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("ps body lacks %s:\n%s", want, body)
 		}
+	}
+}
+
+func TestRestartAndRollback(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	var out bytes.Buffer
+	if err := f.client.Restart(ctx, "hello", &out); err != nil || out.String() != "-----> restarting v2\n" {
+		t.Errorf("restart: %v, %q", err, out.String())
+	}
+	out.Reset()
+	if err := f.client.Rollback(ctx, "hello", "v1", &out); err != nil || out.String() != "-----> release v3 (rollback v1)\n" {
+		t.Errorf("rollback: %v, %q", err, out.String())
+	}
+	if got := f.sup.redeploys(); len(got) != 2 || got[0] != "hello: restart" || got[1] != "hello: rollback v1" {
+		t.Errorf("calls = %v", got)
+	}
+	for _, tc := range []struct {
+		name string
+		call func() error
+		want int
+	}{
+		{"restart unknown app", func() error { return f.client.Restart(ctx, "nope", &out) }, http.StatusNotFound},
+		{"rollback unknown app", func() error { return f.client.Rollback(ctx, "nope", "v1", &out) }, http.StatusNotFound},
+		{"rollback bad version", func() error { return f.client.Rollback(ctx, "hello", "3", &out) }, http.StatusBadRequest},
+	} {
+		if err := tc.call(); !errors.Is(err, &Error{Status: tc.want}) {
+			t.Errorf("%s: %v, want %d", tc.name, err, tc.want)
+		}
+	}
+	if resp := f.raw(t, http.MethodPost, "/api/v1/apps/hello/rollback", "Bearer "+token, "nope"); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad json: %d", resp.StatusCode)
+	}
+	// The operation's error is the stream's error event.
+	f.sup.err = errors.New("v2 did not accept connections on port 8080 within 30s")
+	out.Reset()
+	if err := f.client.Restart(ctx, "hello", &out); err == nil || err.Error() != f.sup.err.Error() {
+		t.Errorf("failed restart: %v", err)
 	}
 }
 

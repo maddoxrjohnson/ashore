@@ -39,6 +39,7 @@ type Store interface {
 	GetApp(ctx context.Context, name string) (store.App, error)
 	GetConfig(ctx context.Context, appID int64) (map[string]string, error)
 	LiveRelease(ctx context.Context, appID int64) (store.Release, error)
+	ReleaseByVersion(ctx context.Context, appID int64, version int) (store.Release, error)
 	CreateRelease(ctx context.Context, appID int64, n store.NewRelease) (store.Release, error)
 	MarkBuilt(ctx context.Context, id int64, image string) error
 	MarkFailed(ctx context.Context, id int64) error
@@ -189,6 +190,22 @@ func (s *Supervisor) Redeploy(ctx context.Context, app, note string, out io.Writ
 	return s.send(ctx, app, deployCmd{kind: kindRedeploy, note: note}, out)
 }
 
+// Rollback makes a new release from an earlier one's image and config
+// snapshot and runs it. The old row is never revived: the history shows the
+// rollback as its own release, noted "rollback vN". Only a release that was
+// built can be rolled back to; a failed build has no image.
+func (s *Supervisor) Rollback(ctx context.Context, app string, version int, out io.Writer) error {
+	return s.send(ctx, app, deployCmd{kind: kindRollback, version: version}, out)
+}
+
+// Restart replaces the live release's instance with a fresh one of the same
+// release: no new row, no build. It also clears a crashed app's failure
+// history, which is how an operator ends a crash loop after fixing its
+// cause, and drops any restart the supervisor had scheduled itself.
+func (s *Supervisor) Restart(ctx context.Context, app string, out io.Writer) error {
+	return s.send(ctx, app, deployCmd{kind: kindRestart, manual: true}, out)
+}
+
 // send hands cmd to the app's actor and waits for the verdict.
 func (s *Supervisor) send(ctx context.Context, app string, cmd deployCmd, out io.Writer) error {
 	a, err := s.actorFor(app)
@@ -279,17 +296,20 @@ const (
 	kindPush     kind = iota // a pushed commit: build it, then run it
 	kindRedeploy             // the live image again, with the config as it is now
 	kindRestart              // the live release again, as it is: no new row
+	kindRollback             // an earlier release's image and config, as a new row
 )
 
 type deployCmd struct {
-	ctx   context.Context
-	kind  kind
-	sha   string // kindPush
-	note  string // kindRedeploy: the release note
-	out   io.Writer
-	reply chan error // buffered: the actor never waits for the caller
+	ctx     context.Context
+	kind    kind
+	sha     string // kindPush
+	note    string // kindRedeploy: the release note
+	version int    // kindRollback: the release to go back to
+	out     io.Writer
+	reply   chan error // buffered: the actor never waits for the caller
 
 	quarantine string // kindPush
+	manual     bool   // kindRestart: asked for, not scheduled; resets the failure history
 }
 
 func (a *actor) run(ctx context.Context) {
@@ -439,7 +459,24 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		if err != nil {
 			return err
 		}
+		if cmd.manual {
+			a.retry, a.failures = nil, nil
+			_, _ = fmt.Fprintf(out, "-----> restarting %s\n", rel.Name())
+		}
 		return a.launchAndSwap(cmd, app, rel, out)
+	case kindRollback:
+		target, err := s.store.ReleaseByVersion(ctx, app.ID, cmd.version)
+		if err != nil {
+			return fmt.Errorf("%s: %w", a.name, err)
+		}
+		if target.Image == "" {
+			return fmt.Errorf("%s %s has no image to roll back to (status %s)", a.name, target.Name(), target.Status)
+		}
+		if live, err := s.store.LiveRelease(ctx, app.ID); err == nil && live.ID == target.ID {
+			return fmt.Errorf("%s %s is already live", a.name, target.Name())
+		}
+		n = store.NewRelease{Image: target.Image, GitSHA: target.GitSHA, ConfigJSON: target.ConfigJSON,
+			ManifestJSON: target.ManifestJSON, Note: "rollback " + target.Name()}
 	case kindPush:
 		data, found, err := s.readManifest(ctx, gitserver.RepoPath(s.cfg.DataDir, a.name), cmd.sha, cmd.quarantine)
 		if err != nil {
@@ -463,11 +500,15 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 		}
 		n = store.NewRelease{Image: live.Image, GitSHA: live.GitSHA, ManifestJSON: live.ManifestJSON, Note: cmd.note}
 	}
-	vars, err := s.store.GetConfig(ctx, app.ID)
-	if err != nil {
-		return err
+	if cmd.kind != kindRollback {
+		// A rollback runs the old snapshot; everything else runs the config
+		// as it is now.
+		vars, err := s.store.GetConfig(ctx, app.ID)
+		if err != nil {
+			return err
+		}
+		n.ConfigJSON = store.MarshalConfig(vars)
 	}
-	n.ConfigJSON = store.MarshalConfig(vars)
 
 	// The release row comes first, so the version is fixed and announced
 	// before any work starts. From here on every failure must end the row
@@ -480,7 +521,7 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 	if cmd.kind == kindPush {
 		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), short)
 	} else {
-		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), cmd.note)
+		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), rel.Note)
 	}
 	if usingManifest != "" {
 		_, _ = fmt.Fprintf(out, "-----> %s: %s\n", manifest.FileName, usingManifest)

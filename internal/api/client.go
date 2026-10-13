@@ -28,6 +28,26 @@ func (c *Client) Config(ctx context.Context, app string) (map[string]string, err
 	return vars, err
 }
 
+// Restart restarts the app's live release, streaming progress to out.
+func (c *Client) Restart(ctx context.Context, app string, out io.Writer) error {
+	resp, err := c.do(ctx, http.MethodPost, "/api/v1/apps/"+app+"/restart", struct{}{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return readStream(resp.Body, out)
+}
+
+// Rollback makes a new release from version ("v3") and runs it.
+func (c *Client) Rollback(ctx context.Context, app, version string, out io.Writer) error {
+	resp, err := c.do(ctx, http.MethodPost, "/api/v1/apps/"+app+"/rollback", RollbackRequest{Version: version})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return readStream(resp.Body, out)
+}
+
 // PS returns the app's instances.
 func (c *Client) PS(ctx context.Context, app string) (PS, error) {
 	var out PS

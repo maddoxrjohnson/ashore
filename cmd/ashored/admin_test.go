@@ -175,6 +175,14 @@ func (redeployer) Redeploy(context.Context, string, string, io.Writer) error {
 
 func (redeployer) Status(string) (supervisor.Status, bool) { return supervisor.Status{}, false }
 
+func (redeployer) Restart(context.Context, string, io.Writer) error {
+	return errors.New("unexpected restart")
+}
+
+func (redeployer) Rollback(context.Context, string, int, io.Writer) error {
+	return errors.New("unexpected rollback")
+}
+
 func TestPortOf(t *testing.T) {
 	for in, want := range map[string]int{":8080": 8080, "127.0.0.1:80": 80, "nope": 0} {
 		if got := portOf(in); got != want {

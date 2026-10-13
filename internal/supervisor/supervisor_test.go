@@ -986,6 +986,144 @@ func TestReplacedInstanceExitIsNotAFailure(t *testing.T) {
 	}
 }
 
+func TestManualRestartEndsACrashLoop(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	// Crash it into backoff twice so the history has two failures.
+	for i := 0; i < 2; i++ {
+		f.runtime.exit(st.Instance, 1)
+		f.waitState(t, StateRestarting, "")
+		f.clock.fire(t)
+		st = f.waitState(t, StateRunning, st.Instance)
+	}
+	f.runtime.exit(st.Instance, 1)
+	f.waitState(t, StateRestarting, "")
+	// The operator restarts by hand while the third wait (4s) is pending.
+	var out bytes.Buffer
+	if err := f.sup.Restart(ctx, "hello", &out); err != nil {
+		t.Fatalf("restart: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "-----> restarting v1\n") || !strings.Contains(out.String(), "-----> live at") || strings.Contains(out.String(), "release v") {
+		t.Errorf("restart output:\n%s", out.String())
+	}
+	st = f.waitState(t, StateRunning, st.Instance)
+	if st.Restarts != 3 || st.Release != "v1" {
+		t.Errorf("after manual restart: %+v", st)
+	}
+	// The pending timer is stale and the history is clean: the next crash
+	// waits 1s, and firing the old timer does nothing.
+	f.clock.fire(t)
+	time.Sleep(50 * time.Millisecond)
+	if again, _ := f.sup.Status("hello"); again != st {
+		t.Errorf("stale timer changed status: %+v", again)
+	}
+	f.runtime.exit(st.Instance, 1)
+	if d := f.clock.fire(t); d != time.Second {
+		t.Errorf("first crash after a manual restart waited %s", d)
+	}
+	app, _ := f.store.GetApp(ctx, "hello")
+	if rels, _ := f.store.ListReleases(ctx, app.ID); len(rels) != 1 {
+		t.Errorf("a restart made a release: %+v", rels)
+	}
+}
+
+func TestManualRestartRevivesACrashedApp(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	if _, err := f.deploy(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	st := f.waitState(t, StateRunning, "")
+	for i := 0; i < 9; i++ {
+		f.runtime.exit(st.Instance, 1)
+		f.clock.fire(t)
+		st = f.waitState(t, StateRunning, st.Instance)
+	}
+	f.runtime.exit(st.Instance, 1)
+	st = f.waitState(t, StateCrashed, "")
+	var out bytes.Buffer
+	if err := f.sup.Restart(ctx, "hello", &out); err != nil {
+		t.Fatalf("restart of a crashed app: %v", err)
+	}
+	st = f.waitState(t, StateRunning, st.Instance)
+	if st.Restarts != 10 || f.clock.pending() {
+		t.Errorf("after reviving: %+v, pending %v", st, f.clock.pending())
+	}
+}
+
+func TestRestartNeedsALiveRelease(t *testing.T) {
+	f := newFixture(t, Config{})
+	var out bytes.Buffer
+	if err := f.sup.Restart(context.Background(), "hello", &out); err == nil || !strings.Contains(err.Error(), "no live release") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestRollbackRunsTheOldImageAndConfig(t *testing.T) {
+	f := newFixture(t, Config{})
+	ctx := context.Background()
+	app, _ := f.store.GetApp(ctx, "hello")
+	f.withManifest("[process]\nmemory = \"64m\"\n")
+	if _, err := f.store.UpdateConfig(ctx, app.ID, map[string]string{"GREETING": "one"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deploy(ctx, "hello"); err != nil { // v1: 64m, GREETING=one
+		t.Fatal(err)
+	}
+	f.withManifest("")
+	if _, err := f.store.UpdateConfig(ctx, app.ID, map[string]string{"GREETING": "two"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deploy(ctx, "hello"); err != nil { // v2: defaults, GREETING=two
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := f.sup.Rollback(ctx, "hello", 1, &out); err != nil {
+		t.Fatalf("rollback: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "-----> release v3 (rollback v1)\n") || strings.Contains(out.String(), "building") {
+		t.Errorf("rollback output:\n%s", out.String())
+	}
+	rels, _ := f.store.ListReleases(ctx, app.ID)
+	if len(rels) != 3 || rels[2].Status != store.StatusLive || rels[1].Status != store.StatusSuperseded || rels[0].Status != store.StatusSuperseded {
+		t.Fatalf("releases = %+v", rels)
+	}
+	v1, v3 := rels[0], rels[2]
+	if v3.Image != v1.Image || v3.GitSHA != v1.GitSHA || v3.ConfigJSON != `{"GREETING":"one"}` || v3.ManifestJSON != v1.ManifestJSON || v3.Note != "rollback v1" {
+		t.Errorf("v3 = %+v, want v1's image, commit, config and manifest", v3)
+	}
+	spec := f.runtime.started[2]
+	if spec.Env["GREETING"] != "one" || spec.Memory != 64<<20 || spec.Release != "v3" {
+		t.Errorf("rolled back instance = %+v", spec)
+	}
+	// The config table still says two; a plain redeploy would run it.
+	if vars, _ := f.store.GetConfig(ctx, app.ID); vars["GREETING"] != "two" {
+		t.Errorf("rollback changed the config table: %v", vars)
+	}
+	if f.builder.maxSeen != 1 {
+		t.Errorf("rollback built an image")
+	}
+	f.waitStopped(t, 2)
+
+	// Cannot roll back to what is live, to a failed build, or to nothing.
+	f.builder.err = errors.New("build failed")
+	_, _ = f.deploy(ctx, "hello") // v4 failed, no image
+	for version, want := range map[int]string{3: "already live", 4: "no image", 9: "not found"} {
+		out.Reset()
+		if err := f.sup.Rollback(ctx, "hello", version, &out); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("rollback to v%d: %v, want %q", version, err, want)
+		}
+	}
+	if rels, _ := f.store.ListReleases(ctx, app.ID); len(rels) != 4 {
+		t.Errorf("refused rollbacks made releases: %d", len(rels))
+	}
+}
+
 func TestStatusBeforeAnything(t *testing.T) {
 	f := newFixture(t, Config{})
 	if _, ok := f.sup.Status("hello"); ok {
