@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/api"
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 )
 
 // dispatch runs one command. Arity is checked here so every command body
@@ -20,6 +24,9 @@ func (c *cli) dispatch(ctx context.Context, name string, args []string) error {
 		"config:set": -1, "config:unset": -1, "releases": 1, "releases:info": 2,
 		"releases:rollback": 2, "ps": 1, "restart": 1, "keys:add": 2, "logs": -2,
 	}
+	if name == "logs" {
+		return c.logs(ctx, args)
+	}
 	n, ok := want[name]
 	if !ok {
 		return fmt.Errorf("%w: unknown command %q", errUsage, name)
@@ -29,9 +36,6 @@ func (c *cli) dispatch(ctx context.Context, name string, args []string) error {
 	}
 	if name == "login" {
 		return c.login(ctx, args[0], args[1])
-	}
-	if name == "logs" {
-		return fmt.Errorf("logs is not available yet")
 	}
 	client, err := c.client()
 	if err != nil {
@@ -76,6 +80,65 @@ func (c *cli) dispatch(ctx context.Context, name string, args []string) error {
 		return c.keysAdd(ctx, client, args[0], args[1])
 	}
 	return fmt.Errorf("%w: unknown command %q", errUsage, name)
+}
+
+// logs prints an app's recent lines and, with -f, keeps printing until
+// interrupted. -n sets how many recent lines to start with.
+func (c *cli) logs(ctx context.Context, args []string) error {
+	var app string
+	follow, tail := false, api.DefaultTail
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; a {
+		case "-f", "--follow":
+			follow = true
+		case "-n", "--tail":
+			if i+1 >= len(args) {
+				return fmt.Errorf("%w: %s needs a number", errUsage, a)
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n < 0 {
+				return fmt.Errorf("%w: %s needs a non-negative number", errUsage, a)
+			}
+			tail = n
+			i++
+		default:
+			if app != "" || strings.HasPrefix(a, "-") {
+				return fmt.Errorf("%w for logs", errUsage)
+			}
+			app = a
+		}
+	}
+	if app == "" {
+		return fmt.Errorf("%w for logs", errUsage)
+	}
+	client, err := c.client()
+	if err != nil {
+		return err
+	}
+	if follow {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+	}
+	enc := json.NewEncoder(c.out)
+	return client.Logs(ctx, app, tail, follow, func(l logs.Line) error {
+		if c.json {
+			return enc.Encode(l)
+		}
+		_, err := fmt.Fprintln(c.out, formatLine(l))
+		return err
+	})
+}
+
+// formatLine is one log line for a terminal: when, which release and
+// stream, and the text. Lines the daemon adds (dropped-line notices) name
+// the daemon instead of a release.
+func formatLine(l logs.Line) string {
+	who := l.Release
+	if l.Stream == logs.StreamSystem {
+		who = "ashore"
+	}
+	return l.Time.Local().Format("2006-01-02T15:04:05.000") + " " + who + "[" + l.Stream + "]: " + l.Text
 }
 
 func (c *cli) table(write func(tw *tabwriter.Writer)) error {

@@ -96,6 +96,14 @@ func (h *Hub) Sink(app string) *Sink {
 	return s
 }
 
+// Tail returns an app's last n lines, oldest first.
+func (h *Hub) Tail(app string, n int) []Line { return h.Sink(app).Tail(n) }
+
+// Subscribe is Sink.Subscribe for app.
+func (h *Hub) Subscribe(app string, tail int) (<-chan Line, func()) {
+	return h.Sink(app).Subscribe(tail)
+}
+
 // Collect reads the instance's output until it exits or ctx ends, splitting
 // it into lines and appending them to the app's sink. It is the one reader
 // of the runtime's stream for that instance; whoever starts an instance

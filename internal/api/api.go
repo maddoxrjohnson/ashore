@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -35,6 +36,12 @@ type Store interface {
 	ListReleases(ctx context.Context, appID int64) ([]store.Release, error)
 	ReleaseByVersion(ctx context.Context, appID int64, version int) (store.Release, error)
 	AddKey(ctx context.Context, name, fingerprint, pubkey string) (store.Key, error)
+}
+
+// Logs is where the API reads an app's output; *logs.Hub satisfies it.
+type Logs interface {
+	Tail(app string, n int) []logs.Line
+	Subscribe(app string, tail int) (<-chan logs.Line, func())
 }
 
 // Config is what the API needs to know about the daemon it fronts.
@@ -80,6 +87,7 @@ const (
 type Server struct {
 	store Store
 	sup   Supervisor
+	logs  Logs
 	token []byte
 	cfg   Config
 	log   *slog.Logger
@@ -87,12 +95,13 @@ type Server struct {
 }
 
 // New wires the routes. token is the admin token every request must carry.
-// A nil logger means slog.Default.
-func New(st Store, sup Supervisor, token string, cfg Config, log *slog.Logger) *Server {
+// lg may be nil, in which case the logs endpoint answers 503. A nil logger
+// means slog.Default.
+func New(st Store, sup Supervisor, lg Logs, token string, cfg Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: st, sup: sup, token: []byte(token), cfg: cfg, log: log, mux: http.NewServeMux()}
+	s := &Server{store: st, sup: sup, logs: lg, token: []byte(token), cfg: cfg, log: log, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /api/v1/apps", s.listApps)
 	s.mux.HandleFunc("POST /api/v1/apps", s.createApp)
 	s.mux.HandleFunc("GET /api/v1/apps/{app}", s.getApp)
@@ -105,6 +114,7 @@ func New(st Store, sup Supervisor, token string, cfg Config, log *slog.Logger) *
 	s.mux.HandleFunc("GET /api/v1/apps/{app}/ps", s.ps)
 	s.mux.HandleFunc("POST /api/v1/apps/{app}/restart", s.restart)
 	s.mux.HandleFunc("POST /api/v1/apps/{app}/rollback", s.rollback)
+	s.mux.HandleFunc("GET /api/v1/apps/{app}/logs", s.appLogs)
 	return s
 }
 

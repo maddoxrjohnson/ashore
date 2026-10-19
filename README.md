@@ -149,6 +149,15 @@ ring: each gets a bounded channel, sends to it never block, and a reader that fa
 loses lines and is then handed one line saying how many, so a stalled tab can never slow
 the app or the collector.
 
+    ./bin/ashore logs chatty              # the last 100 lines
+    ./bin/ashore logs -f -n 10 chatty     # ten lines, then follow until Ctrl-C
+    ./bin/ashore logs --json chatty       # one JSON object per line
+
+`examples/chatty` prints a line a second, so `logs -f` has something to show. The API
+serves the same stream as server-sent events at `GET /api/v1/apps/<app>/logs?tail=N&follow=1`,
+one `line` event per line with the line as JSON, and a `done` event when the app is
+destroyed; the dashboard reads it with `EventSource`.
+
 ## Daemon restarts
 
 The containers belong to Docker, not to the daemon, so they keep serving while `ashored` is

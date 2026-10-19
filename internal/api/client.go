@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 )
 
 // Client calls the API. URL is the daemon's internal address with scheme,
@@ -192,6 +195,20 @@ func (e *Error) Error() string { return e.Message }
 // readStream copies a progress stream's lines to out until its done or
 // error event. A stream that ends without either is ErrStream.
 func readStream(r io.Reader, out io.Writer) error {
+	return readEvents(r, func(event, data string) error {
+		if event == "" {
+			_, err := fmt.Fprintln(out, data)
+			return err
+		}
+		return nil
+	})
+}
+
+// readEvents parses server-sent events and calls fn for each one that is
+// neither the done nor the error event; those end the read. An error event
+// is returned as an error; a stream that ends without a verdict is
+// ErrStream. Comment lines are skipped.
+func readEvents(r io.Reader, fn func(event, data string) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	var event string
@@ -200,6 +217,9 @@ func readStream(r io.Reader, out io.Writer) error {
 		line := sc.Text()
 		switch {
 		case line == "":
+			if len(data) == 0 && event == "" {
+				continue // a comment's blank line
+			}
 			text := strings.Join(data, "\n")
 			switch event {
 			case eventDone:
@@ -208,12 +228,14 @@ func readStream(r io.Reader, out io.Writer) error {
 				return errors.New(text)
 			default:
 				if len(data) > 0 {
-					if _, err := fmt.Fprintln(out, text); err != nil {
+					if err := fn(event, text); err != nil {
 						return err
 					}
 				}
 			}
 			event, data = "", nil
+		case strings.HasPrefix(line, ":"):
+			// a comment, such as a keepalive
 		case strings.HasPrefix(line, "event: "):
 			event = strings.TrimPrefix(line, "event: ")
 		case strings.HasPrefix(line, "data: "):
@@ -226,6 +248,35 @@ func readStream(r io.Reader, out io.Writer) error {
 		return err
 	}
 	return ErrStream
+}
+
+// Logs reads the app's recent lines and, with follow, keeps reading until
+// ctx ends or the app is destroyed, calling fn for each line. tail is how
+// many recent lines to start with.
+func (c *Client) Logs(ctx context.Context, app string, tail int, follow bool, fn func(logs.Line) error) error {
+	path := "/api/v1/apps/" + app + "/logs?tail=" + strconv.Itoa(tail)
+	if follow {
+		path += "&follow=1"
+	}
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	err = readEvents(resp.Body, func(event, data string) error {
+		if event != eventLine {
+			return nil
+		}
+		var l logs.Line
+		if err := json.Unmarshal([]byte(data), &l); err != nil {
+			return fmt.Errorf("bad line event: %w", err)
+		}
+		return fn(l)
+	})
+	if ctx.Err() != nil {
+		return nil // the caller stopped following; not an error
+	}
+	return err
 }
 
 // Is makes errors.Is(err, &Error{}) match any API error, and

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -81,6 +82,7 @@ type fixture struct {
 	sup     *fakeSup
 	server  *httptest.Server
 	client  *Client
+	hub     *logs.Hub
 	app     store.App
 	dataDir string
 }
@@ -100,7 +102,9 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f := &fixture{store: st, sup: &fakeSup{}, app: app}
 	f.dataDir = t.TempDir()
-	f.server = httptest.NewServer(New(st, f.sup, token, Config{DataDir: f.dataDir, Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
+	f.hub = logs.New(f.dataDir, nil, nil)
+	t.Cleanup(func() { _ = f.hub.Close() })
+	f.server = httptest.NewServer(New(st, f.sup, f.hub, token, Config{DataDir: f.dataDir, Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
 		slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(f.server.Close)
 	f.client = &Client{URL: f.server.URL, Token: token, HTTP: f.server.Client()}
@@ -402,5 +406,110 @@ func TestToken(t *testing.T) {
 	}
 	if _, err := LoadToken(dir); err == nil {
 		t.Error("an empty token file was accepted")
+	}
+}
+
+func TestLogsTailAndFollow(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	sink := f.hub.Sink("hello")
+	for i := 1; i <= 5; i++ {
+		sink.Append(logs.Line{App: "hello", Release: "v1", Stream: logs.StreamStdout, Time: time.Unix(int64(i), 0).UTC(), Text: fmt.Sprintf("line %d", i)})
+	}
+
+	// A plain request answers with the tail and ends.
+	var got []string
+	err := f.client.Logs(ctx, "hello", 2, false, func(l logs.Line) error {
+		got = append(got, l.Text)
+		return nil
+	})
+	if err != nil || strings.Join(got, "|") != "line 4|line 5" {
+		t.Fatalf("tail: %v %q", err, got)
+	}
+	// The raw shape: one line event per line, JSON data, then done.
+	resp := f.raw(t, http.MethodGet, "/api/v1/apps/hello/logs?tail=1", "Bearer "+token, "")
+	body, _ := io.ReadAll(resp.Body)
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("content type %q", ct)
+	}
+	if want := "event: line\ndata: {\"app\":\"hello\",\"release\":\"v1\",\"stream\":\"stdout\",\"time\":\"1970-01-01T00:00:05Z\",\"text\":\"line 5\"}\n\nevent: done\ndata: \n\n"; string(body) != want {
+		t.Errorf("body:\n%s\nwant:\n%s", body, want)
+	}
+
+	// Following delivers the tail, then lines as they arrive, until the
+	// caller stops.
+	fctx, cancel := context.WithCancel(ctx)
+	lines := make(chan string, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- f.client.Logs(fctx, "hello", 1, true, func(l logs.Line) error {
+			lines <- l.Text
+			return nil
+		})
+	}()
+	if l := <-lines; l != "line 5" {
+		t.Fatalf("first followed line %q", l)
+	}
+	sink.Append(logs.Line{App: "hello", Text: "line 6"})
+	if l := <-lines; l != "line 6" {
+		t.Fatalf("live line %q", l)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("follow ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not end after cancel")
+	}
+
+	// Destroying the app ends a follow with done, not an error.
+	go func() {
+		done <- f.client.Logs(ctx, "hello", 0, true, func(logs.Line) error { return nil })
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := f.hub.Forget("hello"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("follow after forget: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not end after the app was forgotten")
+	}
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/api/v1/apps/nope/logs", http.StatusNotFound},
+		{"/api/v1/apps/hello/logs?tail=x", http.StatusBadRequest},
+		{"/api/v1/apps/hello/logs?tail=-1", http.StatusBadRequest},
+	} {
+		if resp := f.raw(t, http.MethodGet, tc.path, "Bearer "+token, ""); resp.StatusCode != tc.want {
+			t.Errorf("%s: %d, want %d", tc.path, resp.StatusCode, tc.want)
+		}
+	}
+	// Without a hub the endpoint says so instead of panicking.
+	srv := httptest.NewServer(New(f.store, f.sup, nil, token, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/apps/hello/logs", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if resp, err := srv.Client().Do(req); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("no hub: %v %v", resp, err)
+	}
+}
+
+func TestReadEventsSkipsComments(t *testing.T) {
+	var got []string
+	err := readEvents(strings.NewReader(": keepalive\n\nevent: line\ndata: {\"a\":1}\n\n: again\n\nevent: done\ndata: \n\n"), func(event, data string) error {
+		got = append(got, event+"="+data)
+		return nil
+	})
+	if err != nil || len(got) != 1 || got[0] != `line={"a":1}` {
+		t.Fatalf("%v %q", err, got)
 	}
 }

@@ -14,10 +14,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/maddoxrjohnson/ashore/internal/api"
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -61,6 +63,7 @@ func (f *fakeSup) Status(app string) (supervisor.Status, bool) {
 type harness struct {
 	t      *testing.T
 	server *httptest.Server
+	hub    *logs.Hub
 	env    map[string]string
 }
 
@@ -76,11 +79,13 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	srv := httptest.NewServer(api.New(st, &fakeSup{}, token,
+	hub := logs.New(t.TempDir(), nil, nil)
+	t.Cleanup(func() { _ = hub.Close() })
+	srv := httptest.NewServer(api.New(st, &fakeSup{}, hub, token,
 		api.Config{DataDir: t.TempDir(), Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
 		slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(srv.Close)
-	return &harness{t: t, server: srv, env: map[string]string{"ASHORE_CONFIG": filepath.Join(t.TempDir(), "config")}}
+	return &harness{t: t, server: srv, hub: hub, env: map[string]string{"ASHORE_CONFIG": filepath.Join(t.TempDir(), "config")}}
 }
 
 // run runs one command and returns stdout, stderr, and the exit status.
@@ -227,14 +232,29 @@ func TestCLI(t *testing.T) {
 		t.Errorf("destroy twice: %d %q", code, errOut)
 	}
 
-	// Usage errors are exit 2 with the usage text; logs is not here yet.
-	for _, args := range [][]string{nil, {"nope"}, {"apps:create"}, {"config:set", "hello"}, {"releases:info", "hello"}} {
+	// Usage errors are exit 2 with the usage text.
+	for _, args := range [][]string{nil, {"nope"}, {"apps:create"}, {"config:set", "hello"}, {"releases:info", "hello"},
+		{"logs"}, {"logs", "hello", "-n"}, {"logs", "hello", "-n", "x"}, {"logs", "hello", "extra"}, {"logs", "--bogus", "hello"}} {
 		if _, errOut, code := h.run(args...); code != 2 || !strings.Contains(errOut, "usage: ashore") {
 			t.Errorf("%v: %d %q", args, code, errOut)
 		}
 	}
-	if _, errOut, code := h.run("logs", "-f", "hello"); code != 1 || !strings.Contains(errOut, "not available yet") {
-		t.Errorf("logs: %d %q", code, errOut)
+
+	// Logs: the tail, formatted for a terminal or as JSON lines.
+	h.hub.Sink("hello").Append(logs.Line{App: "hello", Release: "v1", Stream: logs.StreamStderr, Time: time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC), Text: "warm"})
+	h.hub.Sink("hello").Append(logs.Line{App: "hello", Stream: logs.StreamSystem, Time: time.Date(2026, 10, 18, 12, 0, 1, 0, time.UTC), Text: "dropped 3 lines"})
+	out = h.ok("logs", "hello")
+	if !strings.Contains(out, " v1[stderr]: warm\n") || !strings.Contains(out, " ashore[ashore]: dropped 3 lines\n") {
+		t.Errorf("logs:\n%s", out)
+	}
+	if out := h.ok("logs", "-n", "1", "hello"); strings.Contains(out, "warm") || !strings.Contains(out, "dropped") {
+		t.Errorf("logs -n 1:\n%s", out)
+	}
+	if out := h.ok("logs", "--json", "hello", "-n", "1"); !strings.HasPrefix(out, `{"app":"hello","stream":"ashore","time":"2026-10-18T12:00:01Z","text":"dropped 3 lines"}`) {
+		t.Errorf("logs --json:\n%s", out)
+	}
+	if _, errOut, code := h.run("logs", "nope"); code != 1 || !strings.Contains(errOut, "not found") {
+		t.Errorf("logs of an unknown app: %d %q", code, errOut)
 	}
 	if out, _, code := h.run("--version"); code != 0 || out != "ashore dev\n" {
 		t.Errorf("--version: %d %q", code, out)

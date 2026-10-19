@@ -31,6 +31,7 @@ const usage = `usage: ashore <command> [arguments]
   releases:info <app> <vN>         show one release
   releases:rollback <app> <vN>     new release from vN's image and config
   ps <app>                         the app's instance, its state, and restarts
+  logs <app> [-f] [-n N]           recent lines (default 100); -f keeps following
   restart <app>                    replace the live release's instance
   keys:add <name> <pubkey-file>    allow a public key to push
 

@@ -113,7 +113,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	as := api.New(st, sup, token, api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}, slog.Default())
+	as := api.New(st, sup, hub, token, api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}, slog.Default())
 
 	hs, err := hook.NewServer(cfg.DataDir, sup)
 	if err != nil {
