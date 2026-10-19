@@ -12,23 +12,15 @@
 package supervisor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
-	"net/http"
-	"os"
-	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/builder"
-	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
-	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/manifest"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	"github.com/maddoxrjohnson/ashore/internal/site"
@@ -57,7 +49,6 @@ type Builder interface {
 // Router is the routing table the supervisor swaps; *router.Router satisfies it.
 type Router interface {
 	Set(host, app, addr string)
-	Get(host string) (addr string, ok bool)
 	Remove(host string)
 }
 
@@ -69,37 +60,6 @@ type Logs interface {
 	Collect(ctx context.Context, inst runtime.Instance, since time.Time) error
 	Forget(app string) error
 }
-
-// Metrics is told what the supervisor does; the metrics package implements
-// it and noMetrics is the default.
-type Metrics interface {
-	// Deploy counts one finished deploy: metrics.ResultLive or ResultFailed.
-	Deploy(app, result string)
-	// Stage records how long a deploy stage took: build, start, health, swap.
-	Stage(stage string, d time.Duration)
-	// InstanceState reports the app's instance state as ps shows it.
-	InstanceState(app, state string)
-	// InstanceGone reports the app destroyed.
-	InstanceGone(app string)
-	// Restart counts one automatic restart.
-	Restart(app string)
-}
-
-type noMetrics struct{}
-
-func (noMetrics) Deploy(string, string)        {}
-func (noMetrics) Stage(string, time.Duration)  {}
-func (noMetrics) InstanceState(string, string) {}
-func (noMetrics) InstanceGone(string)          {}
-func (noMetrics) Restart(string)               {}
-
-// Deploy stage names, as reported to Metrics.
-const (
-	stageBuild  = "build"
-	stageStart  = "start"
-	stageHealth = "health"
-	stageSwap   = "swap"
-)
 
 // Config is what a deploy needs to know about its surroundings.
 type Config struct {
@@ -122,38 +82,6 @@ type Config struct {
 	ContainerPort int
 }
 
-// Crash handling: an instance that exits on its own is restarted after
-// backoff(n) for its n-th failure inside crashWindow; the crashThreshold-th
-// failure marks the app crashed and nothing more is tried until a restart
-// is asked for.
-const (
-	crashWindow    = 10 * time.Minute
-	crashThreshold = 10
-	maxBackoff     = 60 * time.Second
-)
-
-// backoff is the wait before the n-th restart (n from 1): 1, 2, 4, ... s,
-// capped at maxBackoff.
-func backoff(n int) time.Duration {
-	if n < 1 {
-		n = 1
-	}
-	if n > 7 { // 1<<6 s is already past the cap
-		return maxBackoff
-	}
-	return min(time.Second<<(n-1), maxBackoff)
-}
-
-// Instance defaults for what ashore.toml leaves out.
-const (
-	defaultMemory = 256 << 20
-	defaultCPU    = 1.0
-	healthEvery   = 250 * time.Millisecond // default probe interval
-	healthHold    = 300 * time.Millisecond // how long a TCP probe connection must stay open
-	probeTimeout  = 2 * time.Second        // one HTTP probe, connect to response
-	logTail       = 20                     // lines shown when an instance dies during its health check
-)
-
 // manifestReader is manifest.ReadRepo's shape; tests substitute a function
 // that returns a file without a repository.
 type manifestReader func(ctx context.Context, repo, sha, quarantine string) (data []byte, found bool, err error)
@@ -161,15 +89,12 @@ type manifestReader func(ctx context.Context, repo, sha, quarantine string) (dat
 // Supervisor runs deploys. Create it with New, call Deploy from any
 // goroutine, and run Run to tie its lifetime to the daemon's.
 type Supervisor struct {
-	// Metrics receives counts and durations; set it before Run. The
-	// default discards them.
-	Metrics Metrics
-
 	store   Store
 	builder Builder
 	runtime runtime.Runtime
 	router  Router
 	logs    Logs
+	obs     Observer
 	cfg     Config
 	log     *slog.Logger
 	builds  chan struct{} // the build semaphore
@@ -188,17 +113,32 @@ type Supervisor struct {
 	actors sync.WaitGroup
 }
 
-// New wires the supervisor. lg may be nil; a nil logger means slog.Default.
-func New(st Store, b Builder, rt runtime.Runtime, r Router, lg Logs, cfg Config, log *slog.Logger) *Supervisor {
-	if log == nil {
-		log = slog.Default()
+// Deps is what the supervisor is built from. Store, Builder, Runtime, and
+// Router are required; Logs, Observer, and Log may be nil (no log
+// collection, no metrics, the default logger).
+type Deps struct {
+	Store    Store
+	Builder  Builder
+	Runtime  runtime.Runtime
+	Router   Router
+	Logs     Logs
+	Observer Observer
+	Log      *slog.Logger
+}
+
+// New wires the supervisor.
+func New(d Deps, cfg Config) *Supervisor {
+	if d.Log == nil {
+		d.Log = slog.Default()
+	}
+	if d.Observer == nil {
+		d.Observer = noObserver{}
 	}
 	if cfg.BuildConcurrency < 1 {
 		cfg.BuildConcurrency = 1
 	}
 	sup := &Supervisor{
-		Metrics: noMetrics{},
-		store:   st, builder: b, runtime: rt, router: r, logs: lg, cfg: cfg, log: log,
+		store: d.Store, builder: d.Builder, runtime: d.Runtime, router: d.Router, logs: d.Logs, obs: d.Observer, cfg: cfg, log: d.Log,
 		builds:       make(chan struct{}, cfg.BuildConcurrency),
 		apps:         make(map[string]*actor),
 		readManifest: manifest.ReadRepo,
@@ -340,170 +280,6 @@ func (s *Supervisor) Status(app string) (Status, bool) {
 	return a.status()
 }
 
-// actor is the one goroutine that owns an app's deploy state.
-type actor struct {
-	sup   *Supervisor
-	name  string
-	cmds  chan deployCmd
-	exits chan exitEvent // from watchers; buffered so a watcher never waits on a deploy
-	done  chan struct{}  // closed when the actor has returned
-	busy  atomic.Bool    // a deploy is in progress; the next pusher is told to wait
-
-	current  *running         // what the router points at, if this daemon started it
-	retry    <-chan time.Time // the scheduled restart, nil when none
-	failures []time.Time      // unexpected exits inside crashWindow
-	restarts int              // automatic restarts since the daemon started
-
-	mu   sync.Mutex
-	snap Status // what Status reports; the actor writes, anyone reads
-}
-
-// running is an instance this actor started and what it needs to stop it.
-type running struct {
-	inst   runtime.Instance
-	grace  time.Duration // its manifest's process.grace
-	exited bool          // its process is gone; onExit set this
-}
-
-// exitEvent is a watcher's report: the instance's process ended.
-type exitEvent struct {
-	id   string
-	code int
-	err  error
-}
-
-// kind is what a deploy starts from.
-type kind int
-
-const (
-	kindPush     kind = iota // a pushed commit: build it, then run it
-	kindRedeploy             // the live image again, with the config as it is now
-	kindRestart              // the live release again, as it is: no new row
-	kindRollback             // an earlier release's image and config, as a new row
-	kindDestroy              // stop everything and retire the actor
-	kindAdopt                // take over an instance found running at start
-)
-
-type deployCmd struct {
-	ctx     context.Context
-	kind    kind
-	sha     string // kindPush
-	note    string // kindRedeploy: the release note
-	version int    // kindRollback: the release to go back to
-	out     io.Writer
-	reply   chan error // buffered: the actor never waits for the caller
-
-	quarantine string // kindPush
-	manual     bool   // kindRestart: asked for, not scheduled; resets the failure history
-	host       string // kindDestroy: the route to remove
-	adopt      *running
-	adoptHost  string // kindAdopt: the instance and the route to restore
-}
-
-func (a *actor) run(ctx context.Context) {
-	defer a.sup.actors.Done()
-	defer close(a.done)
-	defer a.sup.forget(a.name)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case cmd := <-a.cmds:
-			if cmd.kind == kindDestroy {
-				cmd.reply <- a.destroy(cmd)
-				return
-			}
-			if cmd.kind == kindAdopt {
-				cmd.reply <- a.adopt(cmd)
-				continue
-			}
-			a.busy.Store(true)
-			cmd.reply <- a.counted(cmd)
-			a.busy.Store(false)
-		case ev := <-a.exits:
-			a.onExit(ctx, ev)
-		case <-a.retry:
-			a.retry = nil
-			a.restart(ctx)
-		}
-	}
-}
-
-// watch waits for one instance to exit and reports it. The actor decides
-// what the exit means; the watcher only knows that it happened. A watcher
-// whose actor has gone (destroy) has no one to tell and ends.
-func (a *actor) watch(ctx context.Context, inst runtime.Instance) {
-	defer a.sup.actors.Done()
-	code, err := a.sup.runtime.Wait(ctx, inst.ID)
-	if ctx.Err() != nil {
-		return
-	}
-	select {
-	case a.exits <- exitEvent{id: inst.ID, code: code, err: err}:
-	case <-a.done:
-	case <-ctx.Done():
-	}
-}
-
-// adopt makes an instance found running at start the actor's current one:
-// route restored, watcher started, no release change. Reconcile is the only
-// caller, before any deploy for the app, so nothing is replaced.
-func (a *actor) adopt(cmd deployCmd) error {
-	s := a.sup
-	if a.current != nil {
-		return fmt.Errorf("%s already has an instance", a.name)
-	}
-	a.current = cmd.adopt
-	s.router.Set(cmd.adoptHost, a.name, cmd.adopt.inst.Addr)
-	a.setStatus(StateRunning, "adopted at start")
-	s.actors.Add(1)
-	go a.watch(s.ctx, cmd.adopt.inst)
-	a.collect(cmd.adopt.inst, s.clock.Now()) // what it printed while no daemon listened is in Docker, not here
-	s.log.Info("instance adopted", "app", a.name, "id", cmd.adopt.inst.ID, "release", cmd.adopt.inst.Release, "addr", cmd.adopt.inst.Addr)
-	return nil
-}
-
-// destroy is the actor's last act: stop what runs, drop the route, and
-// report nothing running. The instance gets its own grace, no drain: the
-// route is gone at the same moment, and there is no new release for
-// requests to move to.
-func (a *actor) destroy(cmd deployCmd) error {
-	s := a.sup
-	a.retry = nil
-	s.router.Remove(cmd.host)
-	if cur := a.current; cur != nil && !cur.exited {
-		if err := s.runtime.Stop(context.WithoutCancel(cmd.ctx), cur.inst.ID, cur.grace); err != nil {
-			return fmt.Errorf("stop %s: %w", cur.inst.Release, err)
-		}
-		s.log.Info("instance stopped", "app", a.name, "id", cur.inst.ID, "release", cur.inst.Release, "reason", "destroy")
-	}
-	a.current = nil
-	a.setStatus(StateStopped, "destroyed")
-	s.Metrics.InstanceGone(a.name)
-	if s.logs != nil {
-		if err := s.logs.Forget(a.name); err != nil {
-			s.log.Warn("forget logs", "app", a.name, "err", err)
-		}
-	}
-	return nil
-}
-
-// collect starts the instance's log collector. It runs from the moment the
-// instance exists, so the lines of a release that then fails its health
-// check are on record too; it ends when the instance exits or the
-// supervisor stops.
-func (a *actor) collect(inst runtime.Instance, since time.Time) {
-	s := a.sup
-	if s.logs == nil {
-		return
-	}
-	s.actors.Add(1)
-	go func() {
-		defer s.actors.Done()
-		_ = s.logs.Collect(s.ctx, inst, since)
-	}()
-}
-
 // forget drops an actor that has returned, so a later command for the same
 // name starts a fresh one instead of finding a closed channel.
 func (s *Supervisor) forget(name string) {
@@ -517,527 +293,5 @@ func (s *Supervisor) forget(name string) {
 			// right after this returns. The map entry still goes.
 		}
 		delete(s.apps, name)
-	}
-}
-
-// onExit handles an instance's exit. Only the current instance matters: a
-// replaced instance exits because retire stopped it, and the runtime may
-// report an instance twice. The dead container is removed, the failure is
-// counted, and a restart is scheduled or the app is given up on.
-func (a *actor) onExit(ctx context.Context, ev exitEvent) {
-	cur := a.current
-	if cur == nil || cur.inst.ID != ev.id || cur.exited {
-		return
-	}
-	cur.exited = true
-	why := fmt.Sprintf("exited with code %d", ev.code)
-	if ev.err != nil {
-		why = "exited: " + ev.err.Error()
-	}
-	a.sup.log.Warn("instance exited", "app", a.name, "id", cur.inst.ID, "release", cur.inst.Release, "code", ev.code, "err", ev.err)
-	if err := a.sup.runtime.Stop(context.WithoutCancel(ctx), cur.inst.ID, 0); err != nil {
-		a.sup.log.Warn("remove exited instance", "app", a.name, "id", cur.inst.ID, "err", err)
-	}
-	a.failed(why)
-}
-
-// failed counts one failure of the running release and either schedules the
-// next restart or, at the threshold, stops trying. The route is left as it
-// is: a 502 with a request id says "the app is here and it is down", which
-// a 404 would not.
-func (a *actor) failed(why string) {
-	s := a.sup
-	now := s.clock.Now()
-	kept := a.failures[:0]
-	for _, t := range a.failures {
-		if now.Sub(t) < crashWindow {
-			kept = append(kept, t)
-		}
-	}
-	a.failures = append(kept, now)
-	n := len(a.failures)
-	if n >= crashThreshold {
-		s.log.Error("app crashed; not restarting until asked", "app", a.name, "failures", n, "window", crashWindow, "last", why)
-		a.setStatus(StateCrashed, fmt.Sprintf("%s; %d failures in %s, giving up", why, n, crashWindow))
-		return
-	}
-	wait := backoff(n)
-	s.log.Warn("scheduling restart", "app", a.name, "reason", why, "attempt", n, "in", wait)
-	a.setStatus(StateRestarting, fmt.Sprintf("%s; restart %d in %s", why, n, wait))
-	a.retry = s.clock.After(wait)
-}
-
-// restart is the scheduled restart: the live release again. A restart that
-// does not come up is one more failure.
-func (a *actor) restart(ctx context.Context) {
-	a.busy.Store(true)
-	defer a.busy.Store(false)
-	if err := a.counted(deployCmd{ctx: ctx, kind: kindRestart, out: io.Discard}); err != nil {
-		a.sup.log.Warn("restart failed", "app", a.name, "err", err)
-		a.failed("restart failed: " + err.Error())
-	}
-}
-
-// counted runs deploy and reports its result to the metrics.
-func (a *actor) counted(cmd deployCmd) error {
-	err := a.deploy(cmd)
-	result := "live"
-	if err != nil {
-		result = "failed"
-	}
-	a.sup.Metrics.Deploy(a.name, result)
-	return err
-}
-
-// setStatus records what ps will show.
-func (a *actor) setStatus(state, detail string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.snap = Status{App: a.name, State: state, Detail: detail, Restarts: a.restarts}
-	if cur := a.current; cur != nil {
-		a.snap.Release, a.snap.Instance, a.snap.Addr, a.snap.StartedAt = cur.inst.Release, cur.inst.ID, cur.inst.Addr, cur.inst.StartedAt
-	}
-	a.sup.Metrics.InstanceState(a.name, state)
-}
-
-func (a *actor) status() (Status, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.snap, a.snap.State != ""
-}
-
-// deploy is one run of the algorithm; the error it returns is the last line
-// the pusher sees. A panic is turned into an error so one bad deploy cannot
-// take the daemon down.
-func (a *actor) deploy(cmd deployCmd) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			a.sup.log.Error("deploy panic", "app", a.name, "panic", r, "stack", string(debug.Stack()))
-			err = fmt.Errorf("internal error: %v", r)
-		}
-	}()
-	s := a.sup
-	ctx, out := cmd.ctx, cmd.out
-	short := gitcmd.ShortSHA(cmd.sha)
-
-	app, err := s.store.GetApp(ctx, a.name)
-	if err != nil {
-		return err
-	}
-
-	// What the release is made of. A push has a commit, its ashore.toml,
-	// and no image yet; a redeploy reuses the live release's image, commit,
-	// and manifest. Both snapshot the config vars as they are now, so the
-	// row says exactly what ran. A manifest that does not parse is refused
-	// here, before a release exists: it is a mistake in the file, not a
-	// deploy that was attempted.
-	var n store.NewRelease
-	var usingManifest string
-	switch cmd.kind {
-	case kindRestart:
-		rel, err := s.store.LiveRelease(ctx, app.ID)
-		if errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("%s has no live release to restart", a.name)
-		}
-		if err != nil {
-			return err
-		}
-		if cmd.manual {
-			a.retry, a.failures = nil, nil
-			_, _ = fmt.Fprintf(out, "-----> restarting %s\n", rel.Name())
-		}
-		return a.launchAndSwap(cmd, app, rel, out)
-	case kindRollback:
-		target, err := s.store.ReleaseByVersion(ctx, app.ID, cmd.version)
-		if err != nil {
-			return fmt.Errorf("%s: %w", a.name, err)
-		}
-		if target.Image == "" {
-			return fmt.Errorf("%s %s has no image to roll back to (status %s)", a.name, target.Name(), target.Status)
-		}
-		if live, err := s.store.LiveRelease(ctx, app.ID); err == nil && live.ID == target.ID {
-			return fmt.Errorf("%s %s is already live", a.name, target.Name())
-		}
-		n = store.NewRelease{Image: target.Image, GitSHA: target.GitSHA, ConfigJSON: target.ConfigJSON,
-			ManifestJSON: target.ManifestJSON, Note: "rollback " + target.Name()}
-	case kindPush:
-		data, found, err := s.readManifest(ctx, gitserver.RepoPath(s.cfg.DataDir, a.name), cmd.sha, cmd.quarantine)
-		if err != nil {
-			return err
-		}
-		m, err := manifest.Parse(data, s.defaults())
-		if err != nil {
-			return err
-		}
-		if found {
-			usingManifest = m.String()
-		}
-		n = store.NewRelease{GitSHA: cmd.sha, ManifestJSON: m.JSON(), Note: "push " + short}
-	case kindRedeploy:
-		live, err := s.store.LiveRelease(ctx, app.ID)
-		if errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("%s has no live release to redeploy; push first", a.name)
-		}
-		if err != nil {
-			return err
-		}
-		n = store.NewRelease{Image: live.Image, GitSHA: live.GitSHA, ManifestJSON: live.ManifestJSON, Note: cmd.note}
-	}
-	if cmd.kind != kindRollback {
-		// A rollback runs the old snapshot; everything else runs the config
-		// as it is now.
-		vars, err := s.store.GetConfig(ctx, app.ID)
-		if err != nil {
-			return err
-		}
-		n.ConfigJSON = store.MarshalConfig(vars)
-	}
-
-	// The release row comes first, so the version is fixed and announced
-	// before any work starts. From here on every failure must end the row
-	// (failed), with a context that still works after the pusher's has
-	// been cancelled.
-	rel, err := s.store.CreateRelease(ctx, app.ID, n)
-	if err != nil {
-		return err
-	}
-	if cmd.kind == kindPush {
-		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), short)
-	} else {
-		_, _ = fmt.Fprintf(out, "-----> release %s (%s)\n", rel.Name(), rel.Note)
-	}
-	if usingManifest != "" {
-		_, _ = fmt.Fprintf(out, "-----> %s: %s\n", manifest.FileName, usingManifest)
-	}
-
-	// Build, under the global cap, unless the image already exists.
-	if rel.Image == "" {
-		if err := s.acquireBuild(ctx, out); err != nil {
-			a.fail(ctx, rel)
-			return err
-		}
-		_, _ = fmt.Fprintf(out, "-----> building %s\n", a.name)
-		buildStart := time.Now()
-		image, err := s.builder.Build(ctx, builder.Job{
-			App: a.name, Repo: gitserver.RepoPath(s.cfg.DataDir, a.name), SHA: cmd.sha, Quarantine: cmd.quarantine,
-		}, out)
-		<-s.builds
-		s.Metrics.Stage(stageBuild, time.Since(buildStart))
-		if err == nil {
-			err = s.store.MarkBuilt(ctx, rel.ID, image)
-		}
-		if err != nil {
-			a.fail(ctx, rel)
-			return err
-		}
-		rel.Image, rel.Status = image, store.StatusStarting // what MarkBuilt wrote; start needs the image
-	}
-
-	return a.launchAndSwap(cmd, app, rel, out)
-}
-
-// launchAndSwap runs a release that has an image and makes it the one the
-// router points at. For a new release (push, redeploy) a failure ends the
-// row as failed and success marks it live; a restart reuses the live row
-// and touches neither.
-func (a *actor) launchAndSwap(cmd deployCmd, app store.App, rel store.Release, out io.Writer) error {
-	s := a.sup
-	ctx := cmd.ctx
-	fail := func(err error) error {
-		if cmd.kind != kindRestart {
-			a.fail(ctx, rel)
-		}
-		return err
-	}
-
-	// Start and wait until it answers. The environment and the manifest
-	// are the row's snapshots, not the values read when the row was made,
-	// so what runs is what the release says ran.
-	env, err := store.UnmarshalConfig(rel.ConfigJSON)
-	if err != nil {
-		return fail(err)
-	}
-	m, err := manifest.FromJSON(rel.ManifestJSON, s.defaults())
-	if err != nil {
-		return fail(err)
-	}
-	if a.current == nil || a.current.exited {
-		a.setStatus(StateStarting, "starting "+rel.Name())
-	}
-	inst, err := a.start(ctx, rel, env, m, app.Host, out)
-	if err == nil && ctx.Err() != nil {
-		// The pusher is gone, so git will not record this commit. Going
-		// live anyway would leave what runs and what is pushed disagreeing.
-		err = ctx.Err()
-		if serr := s.runtime.Stop(context.WithoutCancel(ctx), inst.ID, time.Duration(m.Process.Grace)); serr != nil {
-			s.log.Warn("stop abandoned instance", "app", a.name, "id", inst.ID, "err", serr)
-		}
-	}
-	if err != nil {
-		return fail(err)
-	}
-
-	// The swap. Nothing after it may fail the push: the new release is
-	// serving, and git must record the commit it came from. A pending
-	// restart is for the instance just replaced, so it is dropped; a new
-	// release starts with a clean failure history.
-	swapStart := time.Now()
-	old := a.current
-	s.router.Set(app.Host, a.name, inst.Addr)
-	a.current = &running{inst: inst, grace: time.Duration(m.Process.Grace)}
-	a.retry = nil
-	if cmd.kind == kindRestart {
-		a.restarts++
-		if !cmd.manual {
-			s.Metrics.Restart(a.name)
-		}
-	} else {
-		a.failures = nil
-	}
-	a.setStatus(StateRunning, "")
-	s.actors.Add(1)
-	go a.watch(s.ctx, inst)
-	s.Metrics.Stage(stageSwap, time.Since(swapStart))
-	s.log.Info("route swapped", "app", a.name, "release", rel.Name(), "addr", inst.Addr)
-	_, _ = fmt.Fprintf(out, "-----> live at %s\n", s.cfg.Site.AppURL(app.Host))
-
-	if old != nil && !old.exited {
-		a.retire(old)
-	}
-	if cmd.kind != kindRestart {
-		if err := s.store.SetLive(context.WithoutCancel(ctx), app.ID, rel.ID); err != nil {
-			s.log.Error("mark release live", "app", a.name, "release", rel.Name(), "err", err)
-		}
-	}
-	return nil
-}
-
-// retire stops an instance the route no longer points at, after the drain
-// grace, so requests the proxy had already sent it finish. It runs in its
-// own goroutine so the actor is free for the next command at once; the
-// supervisor's lifetime bounds it, and a daemon shutting down stops the
-// instance without the rest of the wait, because it is superseded either
-// way and reconcile would only have to find it later.
-func (a *actor) retire(old *running) {
-	s := a.sup
-	s.actors.Add(1)
-	go func() {
-		defer s.actors.Done()
-		select {
-		case <-time.After(s.cfg.DrainGrace):
-		case <-s.ctx.Done():
-		}
-		if err := s.runtime.Stop(context.WithoutCancel(s.ctx), old.inst.ID, old.grace); err != nil {
-			s.log.Warn("stop old instance", "app", a.name, "id", old.inst.ID, "err", err)
-			return
-		}
-		s.log.Info("old instance stopped", "app", a.name, "id", old.inst.ID, "release", old.inst.Release, "drained", s.cfg.DrainGrace)
-	}()
-}
-
-// fail ends a release that will not go live. It uses a context that
-// survives the pusher's cancellation, since that is one of the reasons.
-func (a *actor) fail(ctx context.Context, rel store.Release) {
-	if err := a.sup.store.MarkFailed(context.WithoutCancel(ctx), rel.ID); err != nil {
-		a.sup.log.Error("mark release failed", "app", a.name, "release", rel.Name(), "err", err)
-	}
-}
-
-// acquireBuild takes a build slot, telling the pusher when it has to wait.
-func (s *Supervisor) acquireBuild(ctx context.Context, out io.Writer) error {
-	select {
-	case s.builds <- struct{}{}:
-		return nil
-	default:
-	}
-	_, _ = fmt.Fprintln(out, "-----> waiting for a build slot")
-	select {
-	case s.builds <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// defaults are the manifest values for what an app's ashore.toml leaves out.
-func (s *Supervisor) defaults() manifest.Defaults {
-	return manifest.Defaults{
-		Timeout: s.cfg.HealthTimeout, Interval: healthEvery, Grace: s.cfg.StopGrace,
-		Memory: defaultMemory, CPU: defaultCPU,
-	}
-}
-
-// start runs the release with env as its environment and m's limits, and
-// waits for it to pass m's health check. host is the app's hostname, sent
-// as the Host header of an HTTP probe. On any failure the instance is
-// stopped and removed, so a rejected push leaves nothing running.
-func (a *actor) start(ctx context.Context, rel store.Release, env map[string]string, m manifest.Manifest, host string, out io.Writer) (runtime.Instance, error) {
-	s := a.sup
-	port, err := runtime.FreePort()
-	if err != nil {
-		return runtime.Instance{}, err
-	}
-	appPort := s.cfg.ContainerPort
-	if appPort == 0 {
-		appPort = port
-	}
-	startAt := time.Now()
-	inst, err := s.runtime.Start(ctx, runtime.Spec{
-		App: a.name, Release: rel.Name(), Image: rel.Image, Env: env,
-		HostPort: port, ContainerPort: appPort,
-		Memory: int64(m.Process.Memory), CPU: float64(m.Process.CPU),
-	})
-	if err != nil {
-		return runtime.Instance{}, err
-	}
-	s.Metrics.Stage(stageStart, time.Since(startAt))
-	s.log.Info("instance started", "app", a.name, "release", rel.Name(), "id", inst.ID, "addr", inst.Addr)
-	a.collect(inst, time.Time{})
-	if m.Health.Path == "" {
-		_, _ = fmt.Fprintf(out, "-----> waiting for %s to listen on port %d\n", rel.Name(), appPort)
-	} else {
-		_, _ = fmt.Fprintf(out, "-----> waiting for %s to answer GET %s on port %d\n", rel.Name(), m.Health.Path, appPort)
-	}
-
-	healthAt := time.Now()
-	err = a.waitHealthy(ctx, inst, m.Health, host, appPort)
-	s.Metrics.Stage(stageHealth, time.Since(healthAt))
-	if err != nil {
-		bg := context.WithoutCancel(ctx)
-		if a.exited(bg, inst.ID) {
-			a.tail(bg, inst.ID, out)
-		}
-		if serr := s.runtime.Stop(bg, inst.ID, time.Duration(m.Process.Grace)); serr != nil {
-			s.log.Warn("stop failed instance", "app", a.name, "id", inst.ID, "err", serr)
-		}
-		return runtime.Instance{}, err
-	}
-	return inst, nil
-}
-
-// waitHealthy probes the instance every h.Interval until a probe passes,
-// the instance exits, h.Timeout passes, or ctx ends. The probe is a TCP
-// connect-and-hold, or GET h.Path expecting 2xx when the manifest names one.
-func (a *actor) waitHealthy(ctx context.Context, inst runtime.Instance, h manifest.Health, host string, appPort int) error {
-	s := a.sup
-	timeout, interval := time.Duration(h.Timeout), time.Duration(h.Interval)
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	exited := make(chan int, 1)
-	go func() {
-		if code, err := s.runtime.Wait(ctx, inst.ID); err == nil {
-			exited <- code
-		}
-	}()
-
-	tick := time.NewTicker(interval)
-	defer tick.Stop()
-	start := time.Now()
-	var last string // what the latest HTTP probe saw, for the timeout message
-	for {
-		var ok bool
-		if h.Path == "" {
-			ok = listening(ctx, inst.Addr, interval)
-		} else {
-			var detail string
-			ok, detail = answers(ctx, inst.Addr, host, h.Path)
-			if ctx.Err() == nil {
-				last = detail // a probe cut off by the deadline says nothing about the app
-			}
-		}
-		if ok {
-			s.log.Info("instance healthy", "app", a.name, "id", inst.ID, "after", time.Since(start))
-			return nil
-		}
-		select {
-		case code := <-exited:
-			return fmt.Errorf("%s exited with code %d before passing its health check", inst.Release, code)
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				if h.Path == "" {
-					return fmt.Errorf("%s did not accept connections on port %d within %s", inst.Release, appPort, timeout)
-				}
-				return fmt.Errorf("%s did not answer 2xx on GET %s within %s (last: %s)", inst.Release, h.Path, timeout, last)
-			}
-			return ctx.Err()
-		case <-tick.C:
-		}
-	}
-}
-
-// listening reports whether something at addr accepts a connection and
-// keeps it. A connect alone is not enough: Docker's userland proxy accepts
-// on the host port as soon as the container starts and closes the
-// connection at once when nothing listens inside yet. So the probe reads
-// with a short deadline; the deadline passing (or the app speaking first)
-// means a server holds the connection, EOF or a reset means nothing does.
-func listening(ctx context.Context, addr string, dialTimeout time.Duration) bool {
-	c, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = c.Close() }()
-	_ = c.SetReadDeadline(time.Now().Add(healthHold))
-	_, err = c.Read(make([]byte, 1))
-	return err == nil || errors.Is(err, os.ErrDeadlineExceeded)
-}
-
-// probeClient makes HTTP probes. No keep-alive: each probe is one
-// connection, so a probe never holds a socket to an instance that is about
-// to be stopped, and no connection pool is shared between apps.
-var probeClient = &http.Client{
-	Timeout:   probeTimeout,
-	Transport: &http.Transport{DisableKeepAlives: true},
-	// A health endpoint that redirects is not healthy; report the 3xx.
-	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-}
-
-// answers reports whether GET path on the instance returns 2xx, and what it
-// saw when it did not. The Host header is the app's own hostname, so an app
-// that routes by host answers the same way it will for real requests.
-func answers(ctx context.Context, addr, host, path string) (ok bool, detail string) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
-	if err != nil {
-		return false, err.Error()
-	}
-	req.Host = host
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return false, err.Error()
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
-	return resp.StatusCode/100 == 2, resp.Status
-}
-
-// exited reports whether the instance's process has already ended.
-func (a *actor) exited(ctx context.Context, id string) bool {
-	list, err := a.sup.runtime.List(ctx)
-	if err != nil {
-		return false
-	}
-	for _, inst := range list {
-		if inst.ID == id {
-			return !inst.Running
-		}
-	}
-	return false
-}
-
-// tail shows the pusher the last lines an instance wrote before it died.
-func (a *actor) tail(ctx context.Context, id string, out io.Writer) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	var buf bytes.Buffer
-	_ = a.sup.runtime.Logs(ctx, id, time.Time{}, &buf, &buf)
-	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte{'\n'})
-	if len(lines) > logTail {
-		lines = lines[len(lines)-logTail:]
-	}
-	for _, l := range lines {
-		if len(l) > 0 {
-			_, _ = fmt.Fprintf(out, "       %s\n", l)
-		}
 	}
 }

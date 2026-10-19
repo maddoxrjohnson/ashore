@@ -11,6 +11,10 @@ const (
 	StateStopped    = "stopped"    // nothing is running and nothing is scheduled
 )
 
+// States lists every instance state, for anything that keeps a value per
+// state, such as a gauge.
+var States = []string{StateRunning, StateStarting, StateRestarting, StateCrashed, StateStopped}
+
 // Status is what the supervisor knows about an app's instance right now.
 // With one instance per app it is one record; ps prints it.
 type Status struct {

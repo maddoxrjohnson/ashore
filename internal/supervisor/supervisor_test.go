@@ -292,7 +292,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
 	f.logs = logs.New(cfg.DataDir, f.runtime, log)
 	t.Cleanup(func() { _ = f.logs.Close() })
-	f.sup = New(st, f.builder, f.runtime, f.router, f.logs, cfg, log)
+	f.sup = New(Deps{Store: st, Builder: f.builder, Runtime: f.runtime, Router: f.router, Logs: f.logs, Log: log}, cfg)
 	f.sup.clock = f.clock
 	// No repository exists here; a push sees no ashore.toml unless a test
 	// calls withManifest.
@@ -1624,7 +1624,7 @@ func (m *fakeMetrics) Restart(string) {
 func TestMetricsAreReported(t *testing.T) {
 	f := newFixture(t, Config{})
 	m := newFakeMetrics()
-	f.sup.Metrics = m
+	f.sup.obs = m
 	if _, err := f.deploy(context.Background(), "hello"); err != nil {
 		t.Fatal(err)
 	}
@@ -1647,7 +1647,7 @@ func TestMetricsAreReported(t *testing.T) {
 	if got := strings.Join(m.deploys, ","); got != "hello live,hello failed,hello live" {
 		t.Errorf("deploys %q", got)
 	}
-	for stage, want := range map[string]int{stageBuild: 2, stageStart: 2, stageHealth: 2, stageSwap: 2} {
+	for stage, want := range map[string]int{StageBuild: 2, StageStart: 2, StageHealth: 2, StageSwap: 2} {
 		if m.stages[stage] != want {
 			t.Errorf("stage %s observed %d times, want %d", stage, m.stages[stage], want)
 		}

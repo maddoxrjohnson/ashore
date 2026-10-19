@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
 
 func scrape(t *testing.T, m *Metrics) string {
@@ -26,10 +28,10 @@ func TestSeries(t *testing.T) {
 	m.Request("hello", 200, 40*time.Millisecond)
 	m.Request("hello", 502, time.Second)
 	m.UpstreamError("hello")
-	m.Deploy("hello", ResultLive)
-	m.Deploy("hello", ResultFailed)
-	m.Stage(StageBuild, 12*time.Second)
-	m.Stage(StageHealth, 800*time.Millisecond)
+	m.Deploy("hello", supervisor.ResultLive)
+	m.Deploy("hello", supervisor.ResultFailed)
+	m.Stage(supervisor.StageBuild, 12*time.Second)
+	m.Stage(supervisor.StageHealth, 800*time.Millisecond)
 	m.InstanceState("hello", "running")
 	m.InstanceState("hello", "crashed")
 	m.Restart("hello")

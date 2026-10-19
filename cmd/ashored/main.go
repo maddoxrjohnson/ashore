@@ -119,7 +119,9 @@ func run() error {
 	hub := logs.New(cfg.DataDir, drt, slog.Default())
 	hub.Observer = mets
 	defer func() { _ = hub.Close() }()
-	sup := supervisor.New(st, builder.New(docker, cfg.DataDir, cfg.BuildTimeout), drt, rt, hub,
+	sup := supervisor.New(supervisor.Deps{
+		Store: st, Builder: builder.New(docker, cfg.DataDir, cfg.BuildTimeout), Runtime: drt, Router: rt, Logs: hub, Observer: mets, Log: slog.Default(),
+	},
 		supervisor.Config{
 			DataDir:          cfg.DataDir,
 			Site:             where,
@@ -128,8 +130,7 @@ func run() error {
 			StopGrace:        cfg.StopGrace,
 			DrainGrace:       cfg.DrainGrace,
 			ContainerPort:    containerPort,
-		}, slog.Default())
-	sup.Metrics = mets
+		})
 
 	// Routes live in memory, so they are rebuilt from what is running
 	// before any listener opens; a daemon restart is then invisible from

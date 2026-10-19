@@ -15,24 +15,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-)
 
-// Deploy stages the duration histogram is labelled with.
-const (
-	StageBuild  = "build"
-	StageStart  = "start"
-	StageHealth = "health"
-	StageSwap   = "swap"
+	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
-
-// Deploy results.
-const (
-	ResultLive   = "live"
-	ResultFailed = "failed"
-)
-
-// Instance states ashore_instances is labelled with, the supervisor's.
-var instanceStates = []string{"running", "starting", "restarting", "crashed", "stopped"}
 
 // Metrics holds every series the daemon exports. Create it with New.
 type Metrics struct {
@@ -54,7 +39,7 @@ type Metrics struct {
 // runtime name; both end up as labels on ashore_build_info.
 func New(version, rt string) *Metrics {
 	m := &Metrics{reg: prometheus.NewRegistry()}
-	f := promauto{reg: m.reg}
+	f := registrar{reg: m.reg}
 	m.httpRequests = f.counter("ashore_http_requests_total", "Requests the router proxied, by app and response status.", "app", "status")
 	m.httpDuration = f.histogram("ashore_http_request_duration_seconds", "Time from a request's arrival at the router to its last byte.", prometheus.DefBuckets, "app")
 	m.upstreamErrors = f.counter("ashore_http_upstream_errors_total", "Requests the app's instance could not answer (502s).", "app")
@@ -99,18 +84,18 @@ func (m *Metrics) Request(app string, status int, d time.Duration) {
 // UpstreamError implements router.Observer.
 func (m *Metrics) UpstreamError(app string) { m.upstreamErrors.WithLabelValues(app).Inc() }
 
-// Deploy implements supervisor.Metrics.
+// Deploy implements supervisor.Observer.
 func (m *Metrics) Deploy(app, result string) { m.deploys.WithLabelValues(app, result).Inc() }
 
-// Stage implements supervisor.Metrics.
+// Stage implements supervisor.Observer.
 func (m *Metrics) Stage(stage string, d time.Duration) {
 	m.deployDuration.WithLabelValues(stage).Observe(d.Seconds())
 }
 
-// InstanceState implements supervisor.Metrics: the app's gauge for state
+// InstanceState implements supervisor.Observer: the app's gauge for state
 // becomes 1 and every other state's 0, so a sum over apps counts them.
 func (m *Metrics) InstanceState(app, state string) {
-	for _, st := range instanceStates {
+	for _, st := range supervisor.States {
 		v := 0.0
 		if st == state {
 			v = 1
@@ -119,12 +104,12 @@ func (m *Metrics) InstanceState(app, state string) {
 	}
 }
 
-// InstanceGone implements supervisor.Metrics: the app no longer exists.
+// InstanceGone implements supervisor.Observer: the app no longer exists.
 func (m *Metrics) InstanceGone(app string) {
 	m.instances.DeletePartialMatch(prometheus.Labels{"app": app})
 }
 
-// Restart implements supervisor.Metrics.
+// Restart implements supervisor.Observer.
 func (m *Metrics) Restart(app string) { m.restarts.WithLabelValues(app).Inc() }
 
 // Line implements logs.Observer.
@@ -133,22 +118,22 @@ func (m *Metrics) Line(app string) { m.logLines.WithLabelValues(app).Inc() }
 // Dropped implements logs.Observer.
 func (m *Metrics) Dropped(app string, n int) { m.logDropped.WithLabelValues(app).Add(float64(n)) }
 
-// promauto is the little factory the constructor uses: make and register.
-type promauto struct{ reg *prometheus.Registry }
+// registrar is the little factory the constructor uses: make and register.
+type registrar struct{ reg *prometheus.Registry }
 
-func (f promauto) counter(name, help string, labels ...string) *prometheus.CounterVec {
+func (f registrar) counter(name, help string, labels ...string) *prometheus.CounterVec {
 	c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
 	f.reg.MustRegister(c)
 	return c
 }
 
-func (f promauto) gauge(name, help string, labels ...string) *prometheus.GaugeVec {
+func (f registrar) gauge(name, help string, labels ...string) *prometheus.GaugeVec {
 	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
 	f.reg.MustRegister(g)
 	return g
 }
 
-func (f promauto) histogram(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
+func (f registrar) histogram(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
 	h := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
 	f.reg.MustRegister(h)
 	return h
