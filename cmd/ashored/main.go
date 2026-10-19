@@ -24,6 +24,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/hook"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/metrics"
 	"github.com/maddoxrjohnson/ashore/internal/router"
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
 	"github.com/maddoxrjohnson/ashore/internal/store"
@@ -87,9 +88,12 @@ func run() error {
 	}
 	defer func() { _ = docker.Close() }()
 
+	mets := metrics.New(version, cfg.Runtime)
 	rt := router.New(slog.Default())
+	rt.Observer = mets
 	drt := dockerrt.New(docker)
 	hub := logs.New(cfg.DataDir, drt, slog.Default())
+	hub.Observer = mets
 	defer func() { _ = hub.Close() }()
 	sup := supervisor.New(st, builder.New(docker, cfg.DataDir, cfg.BuildTimeout), drt, rt, hub,
 		supervisor.Config{
@@ -101,6 +105,7 @@ func run() error {
 			StopGrace:        cfg.StopGrace,
 			DrainGrace:       cfg.DrainGrace,
 		}, slog.Default())
+	sup.Metrics = mets
 
 	// Routes live in memory, so they are rebuilt from what is running
 	// before any listener opens; a daemon restart is then invisible from
@@ -121,6 +126,8 @@ func run() error {
 	// One internal listener: the API under /api/, the dashboard elsewhere.
 	internal := http.NewServeMux()
 	internal.Handle("/api/", as)
+	internal.Handle("GET /metrics", mets.Handler())
+	internal.HandleFunc("GET /healthz", mets.Healthz)
 	internal.Handle("/", dash)
 
 	hs, err := hook.NewServer(cfg.DataDir, sup)
@@ -173,6 +180,7 @@ func run() error {
 	slog.Info("ssh listening", "addr", sln.Addr().String())
 	slog.Info("http listening", "addr", httpLn.Addr().String(), "domain", cfg.Domain)
 	slog.Info("api listening", "addr", apiLn.Addr().String())
+	mets.SetReady(true)
 	slog.Info("ready", "version", version)
 	return g.Wait()
 }

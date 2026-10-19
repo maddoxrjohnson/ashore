@@ -55,7 +55,7 @@ type Builder interface {
 
 // Router is the routing table the supervisor swaps; *router.Router satisfies it.
 type Router interface {
-	Set(host, addr string)
+	Set(host, app, addr string)
 	Get(host string) (addr string, ok bool)
 	Remove(host string)
 }
@@ -68,6 +68,37 @@ type Logs interface {
 	Collect(ctx context.Context, inst runtime.Instance, since time.Time) error
 	Forget(app string) error
 }
+
+// Metrics is told what the supervisor does; the metrics package implements
+// it and noMetrics is the default.
+type Metrics interface {
+	// Deploy counts one finished deploy: metrics.ResultLive or ResultFailed.
+	Deploy(app, result string)
+	// Stage records how long a deploy stage took: build, start, health, swap.
+	Stage(stage string, d time.Duration)
+	// InstanceState reports the app's instance state as ps shows it.
+	InstanceState(app, state string)
+	// InstanceGone reports the app destroyed.
+	InstanceGone(app string)
+	// Restart counts one automatic restart.
+	Restart(app string)
+}
+
+type noMetrics struct{}
+
+func (noMetrics) Deploy(string, string)        {}
+func (noMetrics) Stage(string, time.Duration)  {}
+func (noMetrics) InstanceState(string, string) {}
+func (noMetrics) InstanceGone(string)          {}
+func (noMetrics) Restart(string)               {}
+
+// Deploy stage names, as reported to Metrics.
+const (
+	stageBuild  = "build"
+	stageStart  = "start"
+	stageHealth = "health"
+	stageSwap   = "swap"
+)
 
 // Config is what a deploy needs to know about its surroundings.
 type Config struct {
@@ -127,6 +158,10 @@ type manifestReader func(ctx context.Context, repo, sha, quarantine string) (dat
 // Supervisor runs deploys. Create it with New, call Deploy from any
 // goroutine, and run Run to tie its lifetime to the daemon's.
 type Supervisor struct {
+	// Metrics receives counts and durations; set it before Run. The
+	// default discards them.
+	Metrics Metrics
+
 	store   Store
 	builder Builder
 	runtime runtime.Runtime
@@ -159,7 +194,8 @@ func New(st Store, b Builder, rt runtime.Runtime, r Router, lg Logs, cfg Config,
 		cfg.BuildConcurrency = 1
 	}
 	sup := &Supervisor{
-		store: st, builder: b, runtime: rt, router: r, logs: lg, cfg: cfg, log: log,
+		Metrics: noMetrics{},
+		store:   st, builder: b, runtime: rt, router: r, logs: lg, cfg: cfg, log: log,
 		builds:       make(chan struct{}, cfg.BuildConcurrency),
 		apps:         make(map[string]*actor),
 		readManifest: manifest.ReadRepo,
@@ -379,7 +415,7 @@ func (a *actor) run(ctx context.Context) {
 				continue
 			}
 			a.busy.Store(true)
-			cmd.reply <- a.deploy(cmd)
+			cmd.reply <- a.counted(cmd)
 			a.busy.Store(false)
 		case ev := <-a.exits:
 			a.onExit(ctx, ev)
@@ -415,7 +451,7 @@ func (a *actor) adopt(cmd deployCmd) error {
 		return fmt.Errorf("%s already has an instance", a.name)
 	}
 	a.current = cmd.adopt
-	s.router.Set(cmd.adoptHost, cmd.adopt.inst.Addr)
+	s.router.Set(cmd.adoptHost, a.name, cmd.adopt.inst.Addr)
 	a.setStatus(StateRunning, "adopted at start")
 	s.actors.Add(1)
 	go a.watch(s.ctx, cmd.adopt.inst)
@@ -440,6 +476,7 @@ func (a *actor) destroy(cmd deployCmd) error {
 	}
 	a.current = nil
 	a.setStatus(StateStopped, "destroyed")
+	s.Metrics.InstanceGone(a.name)
 	if s.logs != nil {
 		if err := s.logs.Forget(a.name); err != nil {
 			s.log.Warn("forget logs", "app", a.name, "err", err)
@@ -532,10 +569,21 @@ func (a *actor) failed(why string) {
 func (a *actor) restart(ctx context.Context) {
 	a.busy.Store(true)
 	defer a.busy.Store(false)
-	if err := a.deploy(deployCmd{ctx: ctx, kind: kindRestart, out: io.Discard}); err != nil {
+	if err := a.counted(deployCmd{ctx: ctx, kind: kindRestart, out: io.Discard}); err != nil {
 		a.sup.log.Warn("restart failed", "app", a.name, "err", err)
 		a.failed("restart failed: " + err.Error())
 	}
+}
+
+// counted runs deploy and reports its result to the metrics.
+func (a *actor) counted(cmd deployCmd) error {
+	err := a.deploy(cmd)
+	result := "live"
+	if err != nil {
+		result = "failed"
+	}
+	a.sup.Metrics.Deploy(a.name, result)
+	return err
 }
 
 // setStatus records what ps will show.
@@ -546,6 +594,7 @@ func (a *actor) setStatus(state, detail string) {
 	if cur := a.current; cur != nil {
 		a.snap.Release, a.snap.Instance, a.snap.Addr, a.snap.StartedAt = cur.inst.Release, cur.inst.ID, cur.inst.Addr, cur.inst.StartedAt
 	}
+	a.sup.Metrics.InstanceState(a.name, state)
 }
 
 func (a *actor) status() (Status, bool) {
@@ -668,10 +717,12 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 			return err
 		}
 		_, _ = fmt.Fprintf(out, "-----> building %s\n", a.name)
+		buildStart := time.Now()
 		image, err := s.builder.Build(ctx, builder.Job{
 			App: a.name, Repo: gitserver.RepoPath(s.cfg.DataDir, a.name), SHA: cmd.sha, Quarantine: cmd.quarantine,
 		}, out)
 		<-s.builds
+		s.Metrics.Stage(stageBuild, time.Since(buildStart))
 		if err == nil {
 			err = s.store.MarkBuilt(ctx, rel.ID, image)
 		}
@@ -730,18 +781,23 @@ func (a *actor) launchAndSwap(cmd deployCmd, app store.App, rel store.Release, o
 	// serving, and git must record the commit it came from. A pending
 	// restart is for the instance just replaced, so it is dropped; a new
 	// release starts with a clean failure history.
+	swapStart := time.Now()
 	old := a.current
-	s.router.Set(app.Host, inst.Addr)
+	s.router.Set(app.Host, a.name, inst.Addr)
 	a.current = &running{inst: inst, grace: time.Duration(m.Process.Grace)}
 	a.retry = nil
 	if cmd.kind == kindRestart {
 		a.restarts++
+		if !cmd.manual {
+			s.Metrics.Restart(a.name)
+		}
 	} else {
 		a.failures = nil
 	}
 	a.setStatus(StateRunning, "")
 	s.actors.Add(1)
 	go a.watch(s.ctx, inst)
+	s.Metrics.Stage(stageSwap, time.Since(swapStart))
 	s.log.Info("route swapped", "app", a.name, "release", rel.Name(), "addr", inst.Addr)
 	_, _ = fmt.Fprintf(out, "-----> live at %s\n", s.url(app.Host))
 
@@ -821,6 +877,7 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 	if err != nil {
 		return runtime.Instance{}, err
 	}
+	startAt := time.Now()
 	inst, err := s.runtime.Start(ctx, runtime.Spec{
 		App: a.name, Release: rel.Name(), Image: rel.Image, Env: env,
 		HostPort: port, ContainerPort: containerPort,
@@ -829,6 +886,7 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 	if err != nil {
 		return runtime.Instance{}, err
 	}
+	s.Metrics.Stage(stageStart, time.Since(startAt))
 	s.log.Info("instance started", "app", a.name, "release", rel.Name(), "id", inst.ID, "addr", inst.Addr)
 	a.collect(inst, time.Time{})
 	if m.Health.Path == "" {
@@ -837,7 +895,10 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 		_, _ = fmt.Fprintf(out, "-----> waiting for %s to answer GET %s on port %d\n", rel.Name(), m.Health.Path, containerPort)
 	}
 
-	if err := a.waitHealthy(ctx, inst, m.Health, host); err != nil {
+	healthAt := time.Now()
+	err = a.waitHealthy(ctx, inst, m.Health, host)
+	s.Metrics.Stage(stageHealth, time.Since(healthAt))
+	if err != nil {
 		bg := context.WithoutCancel(ctx)
 		if a.exited(bg, inst.ID) {
 			a.tail(bg, inst.ID, out)

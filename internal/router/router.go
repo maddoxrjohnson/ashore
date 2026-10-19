@@ -39,8 +39,17 @@ const (
 // backend is one routing table entry. The URL is built once, at Set, so the
 // hot path does no parsing.
 type backend struct {
+	app  string
 	addr string
 	url  *url.URL
+}
+
+// Observer is told about every request the router handles; the metrics
+// package implements it. Methods are called on the hot path and must be
+// cheap. app is "" for a request no route matched.
+type Observer interface {
+	Request(app string, status int, d time.Duration)
+	UpstreamError(app string)
 }
 
 // Router routes by host. Create it with New; it is safe for concurrent use.
@@ -48,6 +57,9 @@ type Router struct {
 	// MaxBody is the largest request body accepted, in bytes. Set it
 	// before the first request.
 	MaxBody int64
+	// Observer sees every request; nil means nobody. Set it before the
+	// first request.
+	Observer Observer
 
 	table atomic.Pointer[map[string]backend]
 	mu    sync.Mutex // serializes writers; readers never take it
@@ -92,16 +104,17 @@ func New(log *slog.Logger) *Router {
 	return r
 }
 
-// Set routes host to addr, a host:port the router can dial.
-func (r *Router) Set(host, addr string) {
+// Set routes host to addr, a host:port the router can dial, on behalf of
+// app, which is how the request is labelled in the metrics and the log.
+func (r *Router) Set(host, app, addr string) {
 	host = hostOf(host)
-	b := backend{addr: addr, url: &url.URL{Scheme: "http", Host: addr}}
+	b := backend{app: app, addr: addr, url: &url.URL{Scheme: "http", Host: addr}}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	next := maps.Clone(*r.table.Load())
 	next[host] = b
 	r.table.Store(&next)
-	r.log.Info("route set", "host", host, "addr", addr)
+	r.log.Info("route set", "host", host, "app", app, "addr", addr)
 }
 
 // Remove drops the route for host. Removing an unknown host does nothing.
@@ -133,7 +146,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rw := &recorder{ResponseWriter: w}
 	host := hostOf(req.Host)
 
-	if b, ok := (*r.table.Load())[host]; ok {
+	b, ok := (*r.table.Load())[host]
+	if ok {
 		req.Header.Set("X-Request-Id", id) // the proxy clones headers into the outbound request
 		req.Body = http.MaxBytesReader(w, req.Body, r.MaxBody)
 		r.proxy.ServeHTTP(rw, req.WithContext(context.WithValue(req.Context(), ctxKey{}, b)))
@@ -141,8 +155,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(rw, fmt.Sprintf("no app at %s (request %s)", host, id), http.StatusNotFound)
 	}
 
-	r.log.Info("http", "host", host, "method", req.Method, "path", req.URL.Path,
-		"status", rw.status, "bytes", rw.bytes, "duration", time.Since(start),
+	elapsed := time.Since(start)
+	if r.Observer != nil {
+		r.Observer.Request(b.app, rw.status, elapsed)
+	}
+	r.log.Info("http", "host", host, "app", b.app, "method", req.Method, "path", req.URL.Path,
+		"status", rw.status, "bytes", rw.bytes, "duration", elapsed,
 		"id", id, "remote", req.RemoteAddr)
 }
 
@@ -150,6 +168,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // the body so a user can quote it and the operator can grep for it.
 func (r *Router) upstreamError(w http.ResponseWriter, req *http.Request, err error) {
 	id := w.Header().Get("X-Request-Id")
+	if r.Observer != nil {
+		r.Observer.UpstreamError(req.Context().Value(ctxKey{}).(backend).app)
+	}
 	var tooBig *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooBig):

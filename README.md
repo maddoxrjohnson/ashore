@@ -158,6 +158,28 @@ serves the same stream as server-sent events at `GET /api/v1/apps/<app>/logs?tai
 one `line` event per line with the line as JSON, and a `done` event when the app is
 destroyed; the dashboard reads it with `EventSource`.
 
+## Metrics
+
+The internal listener exposes Prometheus metrics at `/metrics` and a readiness check at
+`/healthz` (503 until every listener is open, then `ok`). The series are:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `ashore_http_requests_total` | counter | `app`, `status` |
+| `ashore_http_request_duration_seconds` | histogram | `app` |
+| `ashore_http_upstream_errors_total` | counter | `app` |
+| `ashore_deploys_total` | counter | `app`, `result` (`live`, `failed`) |
+| `ashore_deploy_duration_seconds` | histogram | `stage` (`build`, `start`, `health`, `swap`) |
+| `ashore_instances` | gauge | `app`, `status` |
+| `ashore_instance_restarts_total` | counter | `app` |
+| `ashore_log_lines_total` | counter | `app` |
+| `ashore_log_lines_dropped_total` | counter | `app` |
+| `ashore_build_info` | gauge | `version`, `go`, `runtime` |
+
+plus the Go runtime and process collectors. Requests that match no route count under an
+empty `app`. The router, supervisor, and log hub report through small observer interfaces,
+so none of them imports the Prometheus client.
+
 ## Dashboard
 
 The internal listener also serves a small dashboard at `http://127.0.0.1:9000/`: log in

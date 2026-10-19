@@ -1175,7 +1175,7 @@ func TestDestroyStopsAndForgets(t *testing.T) {
 	if _, err := f.store.CreateApp(ctx, "idle", "idle.localhost"); err != nil {
 		t.Fatal(err)
 	}
-	f.router.Set("idle.localhost", "127.0.0.1:1")
+	f.router.Set("idle.localhost", "idle", "127.0.0.1:1")
 	if err := f.sup.Destroy(ctx, "idle"); err != nil {
 		t.Fatal(err)
 	}
@@ -1564,5 +1564,92 @@ func TestAdoptedInstanceIsCollected(t *testing.T) {
 	lines := f.waitLines(t, "hello", 1)
 	if lines[0].Text != "still here" || lines[0].Instance != "old1" {
 		t.Fatalf("lines: %+v", lines)
+	}
+}
+
+// fakeMetrics records what the supervisor reports.
+type fakeMetrics struct {
+	mu      sync.Mutex
+	deploys []string // "app result"
+	stages  map[string]int
+	states  []string // "app state"
+	gone    []string
+	restart int
+}
+
+func newFakeMetrics() *fakeMetrics { return &fakeMetrics{stages: make(map[string]int)} }
+
+func (m *fakeMetrics) Deploy(app, result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deploys = append(m.deploys, app+" "+result)
+}
+
+func (m *fakeMetrics) Stage(stage string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d < 0 {
+		panic("negative stage duration")
+	}
+	m.stages[stage]++
+}
+
+func (m *fakeMetrics) InstanceState(app, state string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.states = append(m.states, app+" "+state)
+}
+
+func (m *fakeMetrics) InstanceGone(app string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gone = append(m.gone, app)
+}
+
+func (m *fakeMetrics) Restart(string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restart++
+}
+
+func TestMetricsAreReported(t *testing.T) {
+	f := newFixture(t, Config{})
+	m := newFakeMetrics()
+	f.sup.Metrics = m
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	f.builder.err = errors.New("nope")
+	if _, err := f.deploy(context.Background(), "hello"); err == nil {
+		t.Fatal("expected the second deploy to fail")
+	}
+	f.builder.err = nil
+	// An unexpected exit restarts the instance, which counts as a restart.
+	f.runtime.exit("inst1", 1)
+	f.waitState(t, StateRestarting, "")
+	f.clock.fire(t)
+	f.waitState(t, StateRunning, "inst1")
+	if err := f.sup.Destroy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if got := strings.Join(m.deploys, ","); got != "hello live,hello failed,hello live" {
+		t.Errorf("deploys %q", got)
+	}
+	for stage, want := range map[string]int{stageBuild: 2, stageStart: 2, stageHealth: 2, stageSwap: 2} {
+		if m.stages[stage] != want {
+			t.Errorf("stage %s observed %d times, want %d", stage, m.stages[stage], want)
+		}
+	}
+	if m.restart != 1 {
+		t.Errorf("restarts %d, want 1", m.restart)
+	}
+	if !slices.Contains(m.states, "hello running") || !slices.Contains(m.states, "hello restarting") || m.states[len(m.states)-1] != "hello stopped" {
+		t.Errorf("states %v", m.states)
+	}
+	if len(m.gone) != 1 || m.gone[0] != "hello" {
+		t.Errorf("gone %v", m.gone)
 	}
 }

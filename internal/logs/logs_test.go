@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,5 +363,34 @@ func TestCollectEndsWithContext(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Collect did not return after cancel")
+	}
+}
+
+type countingObserver struct {
+	mu           sync.Mutex
+	lines, drops int
+}
+
+func (o *countingObserver) Line(string) { o.mu.Lock(); o.lines++; o.mu.Unlock() }
+func (o *countingObserver) Dropped(_ string, n int) {
+	o.mu.Lock()
+	o.drops += n
+	o.mu.Unlock()
+}
+
+func TestObserverCountsLinesAndDrops(t *testing.T) {
+	h := newHub(t, &fakeRuntime{})
+	obs := &countingObserver{}
+	h.Observer = obs
+	s := h.Sink("hello")
+	_, cancel := s.Subscribe(0) // never read
+	defer cancel()
+	for i := range SubscriberBuffer + 10 {
+		s.Append(Line{Text: fmt.Sprint(i)})
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.lines != SubscriberBuffer+10 || obs.drops != 10 {
+		t.Fatalf("lines %d drops %d", obs.lines, obs.drops)
 	}
 }

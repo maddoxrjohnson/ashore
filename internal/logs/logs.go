@@ -50,6 +50,17 @@ const (
 	keepFiles       = 5
 )
 
+// Observer counts what the hub does; the metrics package implements it.
+type Observer interface {
+	Line(app string)           // one line collected
+	Dropped(app string, n int) // n lines a subscriber did not get
+}
+
+type noObserver struct{}
+
+func (noObserver) Line(string)         {}
+func (noObserver) Dropped(string, int) {}
+
 // Hub owns one Sink per app and runs the collectors. Create it with New.
 type Hub struct {
 	dir string // <dataDir>/logs
@@ -58,6 +69,9 @@ type Hub struct {
 
 	// RotateAt is the file size that triggers rotation. Set before use.
 	RotateAt int64
+	// Observer is told about lines and drops. Set before the first sink
+	// is made; the default discards.
+	Observer Observer
 
 	mu     sync.Mutex
 	apps   map[string]*Sink
@@ -70,7 +84,7 @@ func New(dataDir string, rt runtime.Runtime, log *slog.Logger) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Hub{dir: filepath.Join(dataDir, "logs"), rt: rt, log: log, RotateAt: defaultRotateAt, apps: make(map[string]*Sink)}
+	return &Hub{dir: filepath.Join(dataDir, "logs"), rt: rt, log: log, RotateAt: defaultRotateAt, Observer: noObserver{}, apps: make(map[string]*Sink)}
 }
 
 // Sink returns the app's sink, creating it on first use. A sink whose file
@@ -82,7 +96,7 @@ func (h *Hub) Sink(app string) *Sink {
 	if s, ok := h.apps[app]; ok {
 		return s
 	}
-	s := &Sink{app: app, dir: filepath.Join(h.dir, app), ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
+	s := &Sink{app: app, dir: filepath.Join(h.dir, app), obs: h.Observer, ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
 	if !h.closed {
 		f, err := openRotating(filepath.Join(s.dir, "current.log"), h.RotateAt)
 		if err != nil {
@@ -169,6 +183,7 @@ func (h *Hub) Close() error {
 type Sink struct {
 	app string
 	dir string
+	obs Observer
 
 	mu     sync.Mutex
 	file   *rotatingFile // nil when the file could not be opened
@@ -191,8 +206,11 @@ func (s *Sink) Append(l Line) {
 		}
 	}
 	s.ring.push(l)
+	s.obs.Line(s.app)
 	for sub := range s.subs {
-		sub.send(l)
+		if !sub.send(l) {
+			s.obs.Dropped(s.app, 1)
+		}
 	}
 }
 
@@ -259,10 +277,10 @@ type subscriber struct {
 	dropped int
 }
 
-// send delivers l without blocking. A full channel means the reader is
-// behind: the line is counted as dropped and the reader hears about it
-// with the first line that fits again.
-func (sub *subscriber) send(l Line) {
+// send delivers l without blocking and reports whether it got through. A
+// full channel means the reader is behind: the line is counted as dropped
+// and the reader hears about it with the first line that fits again.
+func (sub *subscriber) send(l Line) bool {
 	if sub.dropped > 0 {
 		marker := Line{App: l.App, Stream: StreamSystem, Time: l.Time, Text: fmt.Sprintf("dropped %d lines", sub.dropped)}
 		select {
@@ -270,13 +288,15 @@ func (sub *subscriber) send(l Line) {
 			sub.dropped = 0
 		default:
 			sub.dropped++
-			return
+			return false
 		}
 	}
 	select {
 	case sub.ch <- l:
+		return true
 	default:
 		sub.dropped++
+		return false
 	}
 }
 

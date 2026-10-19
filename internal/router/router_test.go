@@ -97,8 +97,8 @@ func body(t *testing.T, resp *http.Response) string {
 func TestRoutesByHost(t *testing.T) {
 	r, srv, logs := newRouter(t)
 	a, b := newBackend(t, "a"), newBackend(t, "b")
-	r.Set("hello.localhost", addrOf(a))
-	r.Set("Other.localhost", addrOf(b))
+	r.Set("hello.localhost", "hello", addrOf(a))
+	r.Set("Other.localhost", "other", addrOf(b))
 
 	resp := get(t, srv, "hello.localhost", http.Header{"X-Forwarded-For": {"1.2.3.4"}, "X-Forwarded-Proto": {"https"}})
 	if resp.StatusCode != http.StatusOK || body(t, resp) != "a" {
@@ -162,7 +162,7 @@ func TestBackendDownIs502(t *testing.T) {
 	}
 	dead := ln.Addr().String()
 	_ = ln.Close()
-	r.Set("hello.localhost", dead)
+	r.Set("hello.localhost", "hello", dead)
 
 	resp := get(t, srv, "hello.localhost", nil)
 	if resp.StatusCode != http.StatusBadGateway {
@@ -180,7 +180,7 @@ func TestBackendDownIs502(t *testing.T) {
 func TestRemove(t *testing.T) {
 	r, srv, _ := newRouter(t)
 	a := newBackend(t, "a")
-	r.Set("hello.localhost", addrOf(a))
+	r.Set("hello.localhost", "hello", addrOf(a))
 	r.Remove("hello.localhost")
 	r.Remove("hello.localhost") // twice is fine
 	if _, ok := r.Get("hello.localhost"); ok {
@@ -198,7 +198,7 @@ func TestBodyLimit(t *testing.T) {
 		_, _ = io.Copy(io.Discard, req.Body)
 	}))
 	t.Cleanup(sink.Close)
-	r.Set("hello.localhost", addrOf(sink))
+	r.Set("hello.localhost", "hello", addrOf(sink))
 
 	for _, tc := range []struct {
 		size int
@@ -226,7 +226,7 @@ func TestBodyLimit(t *testing.T) {
 func TestSwapUnderLoad(t *testing.T) {
 	r, srv, _ := newRouter(t)
 	a, b := newBackend(t, "a"), newBackend(t, "b")
-	r.Set("hello.localhost", addrOf(a))
+	r.Set("hello.localhost", "hello", addrOf(a))
 
 	const readers, perReader, swaps = 8, 100, 200
 	var wg sync.WaitGroup
@@ -254,9 +254,9 @@ func TestSwapUnderLoad(t *testing.T) {
 	}
 	for i := 0; i < swaps; i++ {
 		if i%2 == 0 {
-			r.Set("hello.localhost", addrOf(b))
+			r.Set("hello.localhost", "hello", addrOf(b))
 		} else {
-			r.Set("hello.localhost", addrOf(a))
+			r.Set("hello.localhost", "hello", addrOf(a))
 		}
 	}
 	wg.Wait()
@@ -282,7 +282,7 @@ func TestStreamingFlushes(t *testing.T) {
 	}))
 	t.Cleanup(stream.Close)
 	t.Cleanup(func() { close(release) })
-	r.Set("hello.localhost", addrOf(stream))
+	r.Set("hello.localhost", "hello", addrOf(stream))
 
 	resp := get(t, srv, "hello.localhost", nil)
 	br := bufio.NewReader(resp.Body)
@@ -304,7 +304,7 @@ func TestStreamingFlushes(t *testing.T) {
 func TestServeStopsWithContext(t *testing.T) {
 	r, _, _ := newRouter(t)
 	a := newBackend(t, "a")
-	r.Set("hello.localhost", addrOf(a))
+	r.Set("hello.localhost", "hello", addrOf(a))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -349,5 +349,54 @@ func TestHostOf(t *testing.T) {
 		if got := hostOf(in); got != want {
 			t.Errorf("hostOf(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// fakeObserver records what the router reports.
+type fakeObserver struct {
+	mu       sync.Mutex
+	requests []string // "app status"
+	errors   []string
+}
+
+func (o *fakeObserver) Request(app string, status int, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if d <= 0 {
+		panic("non-positive duration")
+	}
+	o.requests = append(o.requests, fmt.Sprintf("%s %d", app, status))
+}
+
+func (o *fakeObserver) UpstreamError(app string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.errors = append(o.errors, app)
+}
+
+func TestObserverSeesEveryRequest(t *testing.T) {
+	r, srv, _ := newRouter(t)
+	obs := &fakeObserver{}
+	r.Observer = obs
+	a := newBackend(t, "a")
+	r.Set("hello.localhost", "hello", addrOf(a))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := ln.Addr().String()
+	_ = ln.Close()
+	r.Set("down.localhost", "down", dead)
+	for _, host := range []string{"hello.localhost", "nope.localhost", "down.localhost"} {
+		resp := get(t, srv, host, nil)
+		_ = resp.Body.Close()
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if got := strings.Join(obs.requests, ","); got != "hello 200, 404,down 502" {
+		t.Errorf("requests %q", got)
+	}
+	if len(obs.errors) != 1 || obs.errors[0] != "down" {
+		t.Errorf("errors %v", obs.errors)
 	}
 }
