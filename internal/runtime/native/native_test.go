@@ -82,6 +82,12 @@ func main() {
 		names = append(names, e.Name())
 	}
 	fmt.Printf("root=%s\n", strings.Join(names, ","))
+	status, _ := os.ReadFile("/proc/self/status")
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "CapEff:") || strings.HasPrefix(line, "CapPrm:") || strings.HasPrefix(line, "CapBnd:") || strings.HasPrefix(line, "NoNewPrivs:") {
+			fmt.Println(strings.Join(strings.Fields(line), " "))
+		}
+	}
 	_, oldroot := os.Stat("/oldroot")
 	fmt.Printf("oldroot_missing=%v\n", os.IsNotExist(oldroot))
 	if err := os.WriteFile("/written-by-app", []byte("hello"), 0o644); err != nil {
@@ -265,6 +271,12 @@ func TestStartRunsTheAppInItsOwnWorld(t *testing.T) {
 		}
 	} else if !strings.Contains(got, "uid=65534 gid=65534") {
 		t.Errorf("image without USER should run as nobody:\n%s", got)
+	}
+	// Hardened either way: no capabilities in any set, no new privileges.
+	for _, want := range []string{"CapEff: 0000000000000000", "CapPrm: 0000000000000000", "CapBnd: 0000000000000000", "NoNewPrivs: 1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("not hardened, want %q:\n%s", want, got)
+		}
 	}
 
 	// The app's write landed in the upper layer, not in the image.
