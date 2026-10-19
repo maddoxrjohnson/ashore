@@ -31,6 +31,7 @@ type Runtime struct {
 	exporter *exporter
 	dir      string // <dataDir>/instances
 	rootless bool
+	cg       *cgroups // nil: limits are not enforced
 	log      *slog.Logger
 
 	mu    sync.Mutex
@@ -56,15 +57,19 @@ type state struct {
 	Pid       int               `json:"pid"`
 	StartTime uint64            `json:"start_time"` // the kernel's, from /proc/<pid>/stat, against pid reuse
 	Port      int               `json:"port"`
+	Cgroup    string            `json:"cgroup,omitempty"` // the instance's cgroup directory, when limits are enforced
 	CreatedAt time.Time         `json:"created_at"`
 	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 // New returns a runtime keeping its state under <dataDir>/instances and
-// exporting images under <dataDir>/rootfs. Without root it runs rootless:
-// every instance lives in a user namespace where it is root while the
-// host sees the daemon's user; resource limits are then not enforced.
-func New(d Docker, dataDir string, log *slog.Logger) *Runtime {
+// exporting images under <dataDir>/rootfs. cgroupRoot is where instance
+// cgroups are made (a directory on the cgroup v2 filesystem, such as
+// /sys/fs/cgroup/ashore); it is used when the daemon is root and the
+// filesystem is cgroup v2, and limits are not enforced otherwise. Without
+// root the runtime is rootless: every instance lives in a user namespace
+// where it is root while the host sees the daemon's user.
+func New(d Docker, dataDir, cgroupRoot string, log *slog.Logger) *Runtime {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -75,8 +80,17 @@ func New(d Docker, dataDir string, log *slog.Logger) *Runtime {
 		log:      log,
 		procs:    make(map[string]*proc),
 	}
-	if r.rootless {
+	switch {
+	case r.rootless:
 		log.Warn("native runtime without root: user namespaces instead of privileges; memory and cpu limits are not enforced")
+	case cgroupRoot == "" || !cgroup2Mounted(filepath.Dir(cgroupRoot)):
+		log.Warn("native runtime without cgroup v2: memory, cpu, and pids limits are not enforced", "root", cgroupRoot)
+	default:
+		r.cg = &cgroups{root: cgroupRoot}
+		if err := r.cg.setup(); err != nil {
+			log.Warn("native runtime: limits are not enforced", "err", err)
+			r.cg = nil
+		}
 	}
 	return r
 }
@@ -124,7 +138,7 @@ func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, 
 	labels[runtime.LabelApp], labels[runtime.LabelRelease] = s.App, s.Release
 	st := state{ID: id, App: s.App, Release: s.Release, Image: s.Image, Port: s.HostPort, CreatedAt: time.Now(), Labels: labels}
 
-	p, err := r.spawn(ctx, dir, spec, &st)
+	p, err := r.spawn(ctx, dir, spec, &st, s)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return runtime.Instance{}, fmt.Errorf("start %s %s: %w", s.App, s.Release, err)
@@ -138,7 +152,7 @@ func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, 
 }
 
 // spawn starts the child and waits for its verdict on the error pipe.
-func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *state) (*proc, error) {
+func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *state, s runtime.Spec) (*proc, error) {
 	stdout, err := os.OpenFile(filepath.Join(dir, "stdout.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
@@ -180,7 +194,8 @@ func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *stat
 		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
 		cmd.SysProcAttr.GidMappingsEnableSetgroups = false
 	}
-	if err := r.place(cmd, st); err != nil {
+	cgroupFD, err := r.place(cmd, st, s)
+	if err != nil {
 		_ = specW.Close()
 		_ = errW.Close()
 		return nil, err
@@ -188,8 +203,11 @@ func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *stat
 	if err := cmd.Start(); err != nil {
 		_ = specW.Close()
 		_ = errW.Close()
+		_ = cgroupFD.Close()
+		r.unplace(st)
 		return nil, fmt.Errorf("start init: %w", err)
 	}
+	_ = cgroupFD.Close()
 	_ = errW.Close() // only the child holds the write end now
 	err = json.NewEncoder(specW).Encode(spec)
 	_ = specW.Close()
@@ -204,6 +222,7 @@ func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *stat
 	if err != nil {
 		_ = cmd.Process.Kill()
 		<-p.done
+		r.unplace(st)
 		return nil, err
 	}
 	st.Pid = cmd.Process.Pid
@@ -211,13 +230,41 @@ func (r *Runtime) spawn(ctx context.Context, dir string, spec initSpec, st *stat
 	if err := writeState(dir, *st); err != nil {
 		_ = cmd.Process.Kill()
 		<-p.done
+		r.unplace(st)
 		return nil, err
 	}
 	return p, nil
 }
 
-// place puts the child into its cgroup at clone time. Step 4.3 fills it in.
-func (r *Runtime) place(*exec.Cmd, *state) error { return nil }
+// place creates the instance's cgroup with the spec's limits and arranges
+// for the child to be cloned straight into it. The returned file is the
+// cgroup directory, to be closed once the child has started. With no
+// cgroups it does nothing.
+func (r *Runtime) place(cmd *exec.Cmd, st *state, s runtime.Spec) (*os.File, error) {
+	if r.cg == nil {
+		return nil, nil
+	}
+	dir, err := r.cg.create(st.ID, s.Memory, s.CPU, s.Pids)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		_ = r.cg.remove(dir)
+		return nil, fmt.Errorf("open cgroup: %w", err)
+	}
+	st.Cgroup = dir
+	cmd.SysProcAttr.UseCgroupFD = true
+	cmd.SysProcAttr.CgroupFD = int(f.Fd())
+	return f, nil
+}
+
+// unplace removes a cgroup made for a child that did not get going.
+func (r *Runtime) unplace(st *state) {
+	if r.cg != nil && st.Cgroup != "" {
+		_ = r.cg.remove(st.Cgroup)
+	}
+}
 
 // reap waits for the child so it never becomes a zombie, and records how
 // it ended. A process killed by a signal reports 128+signal, as a shell
@@ -371,6 +418,11 @@ func (r *Runtime) Stop(ctx context.Context, id string, grace time.Duration) erro
 		}
 	}
 	_ = grace
+	if r.cg != nil && st.Cgroup != "" {
+		if err := r.cg.remove(st.Cgroup); err != nil {
+			r.log.Warn("remove cgroup", "id", short(id), "err", err)
+		}
+	}
 	return os.RemoveAll(dir)
 }
 

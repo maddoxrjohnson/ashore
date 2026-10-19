@@ -621,9 +621,14 @@ func TestBuildSlotIsShared(t *testing.T) {
 	go func() { errs <- f.sup.Deploy(context.Background(), "hello", sha, "", &out1) }()
 	<-f.builder.started
 	go func() { errs <- f.sup.Deploy(context.Background(), "other", sha, "", &out2) }()
-	time.Sleep(100 * time.Millisecond)
-	if !strings.Contains(out2.String(), "waiting for a build slot") {
-		t.Errorf("second app was not told to wait for a slot:\n%s", out2.String())
+	// The second deploy reaches the slot only after its own store work; on
+	// a slow machine that takes longer than a fixed sleep.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out2.String(), "waiting for a build slot") {
+		if time.Now().After(deadline) {
+			t.Fatalf("second app was not told to wait for a slot:\n%s", out2.String())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	close(f.builder.block)
 	for i := 0; i < 2; i++ {

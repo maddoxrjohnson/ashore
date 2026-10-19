@@ -47,6 +47,17 @@ import (
 )
 
 func main() {
+	if os.Getenv("HOG") != "" {
+		var held [][]byte
+		for {
+			chunk := make([]byte, 4<<20)
+			for i := 0; i < len(chunk); i += 4096 {
+				chunk[i] = 1
+			}
+			held = append(held, chunk)
+			fmt.Printf("holding %d MiB\n", len(held)*4)
+		}
+	}
 	host, _ := os.Hostname()
 	wd, _ := os.Getwd()
 	fmt.Printf("pid=%d hostname=%s uid=%d gid=%d cwd=%s port=%s host=%s greeting=%s\n",
@@ -148,7 +159,7 @@ func newTestRuntime(t *testing.T) *Runtime {
 		t.Fatal(err)
 	}
 	d := &fakeDocker{id: "probe", tarball: func() []byte { t.Fatal("export should not run"); return nil }}
-	r := New(d, dataDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(d, dataDir, filepath.Join(dataDir, "cgroup", "ashore"), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(func() {
 		if list, _ := r.List(context.Background()); len(list) > 0 {
 			for _, inst := range list {
@@ -400,4 +411,57 @@ func hostMounts(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// TestMemoryLimitKillsTheHog needs root and cgroup v2: the probe in HOG
+// mode allocates until the kernel's OOM killer ends it at memory.max, and
+// the cgroup's memory.events says so. It is the Phase 4 acceptance's
+// memhog check in miniature.
+func TestMemoryLimitKillsTheHog(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root: sudo go test -run TestMemoryLimit ./internal/runtime/native/")
+	}
+	if !cgroup2Mounted("/sys/fs/cgroup") {
+		t.Skip("/sys/fs/cgroup is not cgroup v2")
+	}
+	img := probeImage(t)
+	dataDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dataDir, "rootfs"), 0o755)
+	_ = os.Symlink(img, filepath.Join(dataDir, "rootfs", "probe"))
+	r := New(&fakeDocker{id: "probe"}, dataDir, "/sys/fs/cgroup/ashore-test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if r.cg == nil {
+		t.Fatal("cgroups not enabled as root on cgroup v2")
+	}
+	ctx := context.Background()
+	inst, err := r.Start(ctx, runtime.Spec{App: "hog", Release: "v1", Image: "probe", HostPort: freePort(t),
+		Memory: 32 << 20, CPU: 1, Env: map[string]string{"HOG": "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	code, err := r.Wait(wctx, inst.ID)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	st, _ := readState(filepath.Join(r.dir, inst.ID))
+	events, eerr := readEvents(st.Cgroup)
+	if eerr != nil || events["oom_kill"] < 1 {
+		t.Errorf("memory.events: %v %v", events, eerr)
+	}
+	if code != 137 { // 128 + SIGKILL
+		t.Errorf("exit code %d, want 137", code)
+	}
+	var out bytes.Buffer
+	_ = r.Logs(ctx, inst.ID, time.Time{}, &out, io.Discard)
+	if !strings.Contains(out.String(), "holding 4 MiB") || strings.Contains(out.String(), "holding 64 MiB") {
+		t.Errorf("hog output:\n%s", out.String())
+	}
+	if err := r.Stop(ctx, inst.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(st.Cgroup); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cgroup left behind: %v", err)
+	}
+	_ = os.Remove("/sys/fs/cgroup/ashore-test")
 }

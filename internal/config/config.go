@@ -33,6 +33,7 @@ type Config struct {
 	SSHHostKey       string
 	InternalAddr     string
 	Runtime          string // RuntimeDocker or RuntimeNative
+	CgroupRoot       string // where the native runtime makes instance cgroups
 	DockerHost       string
 	BuildConcurrency int
 	BuildTimeout     time.Duration
@@ -54,6 +55,7 @@ func Default() Config {
 		SSHHostKey:       filepath.Join("./data", hostKeyFile),
 		InternalAddr:     "127.0.0.1:9000",
 		Runtime:          RuntimeDocker,
+		CgroupRoot:       "/sys/fs/cgroup/ashore",
 		BuildConcurrency: 2,
 		BuildTimeout:     10 * time.Minute,
 		HealthTimeout:    30 * time.Second,
@@ -103,6 +105,9 @@ func load(getenv func(string) string) (Config, error) {
 	}
 	if v := getenv("ASHORE_RUNTIME"); v != "" {
 		c.Runtime = v
+	}
+	if v := getenv("ASHORE_CGROUP_ROOT"); v != "" {
+		c.CgroupRoot = v
 	}
 	if v := getenv("ASHORE_DOCKER_HOST"); v != "" {
 		c.DockerHost = v
@@ -178,6 +183,9 @@ func (c Config) validate() error {
 	case RuntimeDocker, RuntimeNative:
 	default:
 		return fmt.Errorf("ASHORE_RUNTIME: %q is not %s or %s", c.Runtime, RuntimeDocker, RuntimeNative)
+	}
+	if !filepath.IsAbs(c.CgroupRoot) {
+		return fmt.Errorf("ASHORE_CGROUP_ROOT: %q is not an absolute path", c.CgroupRoot)
 	}
 	if c.BuildConcurrency < 1 {
 		return fmt.Errorf("ASHORE_BUILD_CONCURRENCY: %d is less than 1", c.BuildConcurrency)
