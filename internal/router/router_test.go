@@ -397,6 +397,18 @@ func TestObserverSeesEveryRequest(t *testing.T) {
 		resp := get(t, srv, host, nil)
 		_ = resp.Body.Close()
 	}
+	// The observer hears about a request after its response was written,
+	// which can be after the client has read it; wait for the third.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		obs.mu.Lock()
+		n := len(obs.requests)
+		obs.mu.Unlock()
+		if n >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	obs.mu.Lock()
 	defer obs.mu.Unlock()
 	if got := strings.Join(obs.requests, ","); got != "hello 200, 404,down 502" {
