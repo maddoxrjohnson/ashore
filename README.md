@@ -173,7 +173,9 @@ burst twice that, `0` disables) by a token bucket, before the route lookup, so a
 requests for unknown hosts is refused as cheaply as one for a real app; refused requests
 get a 429 with `Retry-After`. Request bodies are capped at 32 MB, the listeners have
 header and idle timeouts, and the client's own `X-Forwarded-*` headers are dropped before
-the router sets its own.
+the router sets its own. Streaming responses are flushed as they arrive and WebSocket
+upgrades pass through, so an app can serve server-sent events or a socket behind the
+router without any configuration.
 
 ## Metrics
 

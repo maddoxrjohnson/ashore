@@ -400,3 +400,66 @@ func TestObserverSeesEveryRequest(t *testing.T) {
 		t.Errorf("errors %v", obs.errors)
 	}
 }
+
+// TestWebSocketPassthrough drives a WebSocket-style upgrade through the
+// router by hand: the backend hijacks the connection after a 101 and echoes
+// bytes; the client is a raw TCP connection speaking HTTP/1.1. No WebSocket
+// library is involved, since what matters here is that the proxy forwards
+// the Upgrade, returns the 101, and then copies bytes both ways.
+func TestWebSocketPassthrough(t *testing.T) {
+	r, srv, _ := newRouter(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Upgrade") != "websocket" || req.Header.Get("Connection") != "Upgrade" {
+			http.Error(w, "not an upgrade", http.StatusBadRequest)
+			return
+		}
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+		_ = rw.Flush()
+		// Echo until the client hangs up.
+		buf := make([]byte, 64)
+		for {
+			n, err := rw.Read(buf)
+			if err != nil {
+				return
+			}
+			_, _ = rw.Write(buf[:n])
+			_ = rw.Flush()
+		}
+	}))
+	t.Cleanup(backend.Close)
+	r.Set("ws.localhost", "ws", addrOf(backend))
+
+	conn, err := net.Dial("tcp", addrOf(srv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = io.WriteString(conn, "GET /chat HTTP/1.1\r\nHost: ws.localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols || resp.Header.Get("Upgrade") != "websocket" {
+		t.Fatalf("status %d, upgrade %q", resp.StatusCode, resp.Header.Get("Upgrade"))
+	}
+	for _, msg := range []string{"ping", "second frame"} {
+		if _, err := io.WriteString(conn, msg); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(msg))
+		if _, err := io.ReadFull(br, got); err != nil {
+			t.Fatalf("reading echo of %q: %v", msg, err)
+		}
+		if string(got) != msg {
+			t.Fatalf("echo %q, want %q", got, msg)
+		}
+	}
+}
