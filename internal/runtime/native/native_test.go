@@ -43,7 +43,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 func main() {
@@ -57,6 +59,18 @@ func main() {
 			held = append(held, chunk)
 			fmt.Printf("holding %d MiB\n", len(held)*4)
 		}
+	}
+	if os.Getenv("IGNORE") != "" {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	if os.Getenv("TRAP") != "" {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM)
+		go func() {
+			<-ch
+			fmt.Println("got SIGTERM, leaving")
+			os.Exit(0)
+		}()
 	}
 	host, _ := os.Hostname()
 	wd, _ := os.Getwd()
@@ -464,4 +478,144 @@ func TestMemoryLimitKillsTheHog(t *testing.T) {
 		t.Errorf("cgroup left behind: %v", err)
 	}
 	_ = os.Remove("/sys/fs/cgroup/ashore-test")
+}
+
+func TestStopIsGracefulThenForceful(t *testing.T) {
+	r := newTestRuntime(t)
+	ctx := context.Background()
+
+	// An app that handles SIGTERM leaves at once.
+	inst, err := r.Start(ctx, runtime.Spec{App: "probe", Release: "v1", Image: "probe:latest", HostPort: freePort(t), Env: map[string]string{"TRAP": "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPong(t, inst.Addr)
+	var out syncBuffer
+	lctx, cancel := context.WithCancel(ctx)
+	logsDone := make(chan struct{})
+	go func() { _ = r.Logs(lctx, inst.ID, time.Time{}, &out, io.Discard); close(logsDone) }()
+	for !strings.Contains(out.String(), "listening") { // the reader is attached before the stop
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	if err := r.Stop(ctx, inst.ID, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("stop of a SIGTERM-aware app took %s", took)
+	}
+	// The reader ends by itself once the process is gone, after a final
+	// drain; cancelling first would cut that drain short.
+	select {
+	case <-logsDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Logs did not return after the instance exited")
+	}
+	cancel()
+	if !strings.Contains(out.String(), "got SIGTERM, leaving") {
+		t.Errorf("the app did not see SIGTERM:\n%s", out.String())
+	}
+
+	// An app that ignores SIGTERM (or, as PID 1, has no handler for it: the
+	// Go runtime installs one, so the probe ignores it explicitly) lives
+	// until the SIGKILL after the grace.
+	inst, err = r.Start(ctx, runtime.Spec{App: "probe", Release: "v2", Image: "probe:latest", HostPort: freePort(t), Env: map[string]string{"IGNORE": "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPong(t, inst.Addr)
+	start = time.Now()
+	if err := r.Stop(ctx, inst.ID, 500*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took < 500*time.Millisecond || took > 5*time.Second {
+		t.Errorf("stop of a deaf app took %s, want about the grace", took)
+	}
+	if list, _ := r.List(ctx); len(list) != 0 {
+		t.Errorf("after stops: %+v", list)
+	}
+}
+
+func TestAdoptedInstanceAfterARestart(t *testing.T) {
+	r := newTestRuntime(t)
+	ctx := context.Background()
+	inst, err := r.Start(ctx, runtime.Spec{App: "probe", Release: "v1", Image: "probe:latest", HostPort: freePort(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPong(t, inst.Addr)
+
+	// A new runtime over the same data dir knows nothing of the child but
+	// finds it through the state file and /proc.
+	later := New(&fakeDocker{id: "probe"}, filepath.Dir(r.dir), filepath.Join(filepath.Dir(r.dir), "cgroup", "ashore"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	list, err := later.List(ctx)
+	if err != nil || len(list) != 1 || !list[0].Running || list[0].Addr != inst.Addr || list[0].App != "probe" {
+		t.Fatalf("list after restart: %+v %v", list, err)
+	}
+	var out bytes.Buffer
+	lctx, cancel := context.WithTimeout(ctx, time.Second)
+	_ = later.Logs(lctx, inst.ID, time.Time{}, &out, io.Discard)
+	cancel()
+	if !strings.Contains(out.String(), "listening") {
+		t.Errorf("logs after restart:\n%s", out.String())
+	}
+	wctx, wcancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer wcancel()
+	if _, err := later.Wait(wctx, inst.ID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Wait on a running adopted instance: %v", err)
+	}
+
+	// Stop through the later runtime signals by pid; the first runtime's
+	// reaper sees the exit.
+	done := make(chan error, 1)
+	go func() { _, err := r.Wait(ctx, inst.ID); done <- err }()
+	if err := later.Stop(ctx, inst.ID, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("first runtime's Wait: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the child was not reaped")
+	}
+	if list, _ := later.List(ctx); len(list) != 0 {
+		t.Errorf("after stop: %+v", list)
+	}
+	// A stale state file for a pid that is gone lists as not running, and
+	// Wait returns at once with -1.
+	dir := filepath.Join(r.dir, "stale")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = writeState(dir, state{ID: "stale", App: "old", Release: "v1", Pid: 2_000_000, StartTime: 1, Port: 1})
+	_ = os.WriteFile(filepath.Join(dir, "stdout.log"), nil, 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "stderr.log"), nil, 0o600)
+	list, _ = later.List(ctx)
+	if len(list) != 1 || list[0].Running || list[0].ID != "stale" {
+		t.Errorf("stale instance: %+v", list)
+	}
+	if code, err := later.Wait(ctx, "stale"); err != nil || code != -1 {
+		t.Errorf("wait on a stale instance: %d %v", code, err)
+	}
+	if err := later.Stop(ctx, "stale", time.Second); err != nil {
+		t.Errorf("stop of a stale instance: %v", err)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for a writer and a reader.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

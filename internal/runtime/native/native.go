@@ -391,8 +391,12 @@ func (r *Runtime) running(id string, st state) bool {
 	return alive(st)
 }
 
-// Stop ends the instance and removes it. Step 4.4 adds the grace period;
-// for now the process is killed.
+// Stop ends the instance and removes everything it had: SIGTERM, then
+// SIGKILL once grace has passed, then its cgroup and directory. The app is
+// PID 1 of its namespace, and PID 1 ignores a signal it has no handler
+// for, so an app that does not handle SIGTERM lives until the SIGKILL,
+// exactly as under docker stop. A cancelled ctx cuts the grace short.
+// Stopping an instance that is already gone is not an error.
 func (r *Runtime) Stop(ctx context.Context, id string, grace time.Duration) error {
 	dir := filepath.Join(r.dir, id)
 	st, err := readState(dir)
@@ -406,28 +410,61 @@ func (r *Runtime) Stop(ctx context.Context, id string, grace time.Duration) erro
 	p, ok := r.procs[id]
 	r.mu.Unlock()
 	if ok {
-		_ = p.cmd.Process.Kill()
-		<-p.done
+		r.stopChild(ctx, p, grace)
 		r.mu.Lock()
 		delete(r.procs, id)
 		r.mu.Unlock()
-	} else if alive(st) {
-		_ = unix.Kill(st.Pid, unix.SIGKILL)
-		for alive(st) {
-			time.Sleep(50 * time.Millisecond)
-		}
+	} else {
+		r.stopAdopted(ctx, st, grace)
 	}
-	_ = grace
 	if r.cg != nil && st.Cgroup != "" {
 		if err := r.cg.remove(st.Cgroup); err != nil {
 			r.log.Warn("remove cgroup", "id", short(id), "err", err)
 		}
 	}
+	r.log.Info("native instance stopped", "app", st.App, "id", short(id))
 	return os.RemoveAll(dir)
 }
 
-// List reads every instance's state file. Step 4.4 completes it.
-func (r *Runtime) List(ctx context.Context) ([]runtime.Instance, error) {
+// stopChild ends a child of this daemon, whose exit the reaper reports.
+func (r *Runtime) stopChild(ctx context.Context, p *proc, grace time.Duration) {
+	select {
+	case <-p.done:
+		return
+	default:
+	}
+	_ = p.cmd.Process.Signal(unix.SIGTERM)
+	select {
+	case <-p.done:
+		return
+	case <-time.After(grace):
+	case <-ctx.Done():
+	}
+	_ = p.cmd.Process.Kill()
+	<-p.done
+}
+
+// stopAdopted ends an instance a previous daemon started: only /proc says
+// whether it is still there.
+func (r *Runtime) stopAdopted(ctx context.Context, st state, grace time.Duration) {
+	if !alive(st) {
+		return
+	}
+	_ = unix.Kill(st.Pid, unix.SIGTERM)
+	deadline := time.Now().Add(grace)
+	for alive(st) && time.Now().Before(deadline) && ctx.Err() == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	for alive(st) {
+		_ = unix.Kill(st.Pid, unix.SIGKILL)
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// List reads every instance's state file: this daemon's children and the
+// instances of daemons before it, for reconcile. Running is decided from
+// /proc for the latter, with the start time guarding against a reused pid.
+func (r *Runtime) List(context.Context) ([]runtime.Instance, error) {
 	entries, err := os.ReadDir(r.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
