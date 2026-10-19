@@ -27,6 +27,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/metrics"
 	"github.com/maddoxrjohnson/ashore/internal/router"
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
+	"github.com/maddoxrjohnson/ashore/internal/runtime/native"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 	"github.com/maddoxrjohnson/ashore/internal/web"
@@ -39,6 +40,12 @@ func main() {
 	// codes and talks to the user itself, so it never goes through run.
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
 		os.Exit(hook.Run(os.Args[2:], os.Stdin, os.Stdout, os.Stderr, os.Getenv))
+	}
+	// "ashored runtime-init" is the native runtime's container init: the
+	// daemon re-executed into new namespaces, which builds the container's
+	// filesystem and execs the app.
+	if len(os.Args) > 1 && os.Args[1] == "runtime-init" {
+		os.Exit(native.Init(os.Args[2:]))
 	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ashored:", err)
