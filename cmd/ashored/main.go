@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +28,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
 	"github.com/maddoxrjohnson/ashore/internal/runtime/native"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 	"github.com/maddoxrjohnson/ashore/internal/web"
@@ -101,7 +101,9 @@ func run() error {
 	rt.Observer = mets
 	rt.SetRateLimit(cfg.RateLimitRPS)
 	tlsOn := cfg.HTTPSAddr != ""
+	where := site.Site{Domain: cfg.Domain, HTTPPort: site.PortOf(cfg.HTTPAddr), SSHAddr: cfg.SSHAddr}
 	if tlsOn {
+		where.HTTPSPort = site.PortOf(cfg.HTTPSAddr)
 		rt.EnableTLS(router.TLSConfig{Email: cfg.ACMEEmail, CacheDir: filepath.Join(cfg.DataDir, "certs")})
 	}
 	// Both runtimes build with Docker; only the native one runs without it.
@@ -120,9 +122,7 @@ func run() error {
 	sup := supervisor.New(st, builder.New(docker, cfg.DataDir, cfg.BuildTimeout), drt, rt, hub,
 		supervisor.Config{
 			DataDir:          cfg.DataDir,
-			Domain:           cfg.Domain,
-			HTTPPort:         portOf(cfg.HTTPAddr),
-			HTTPS:            tlsOn,
+			Site:             where,
 			BuildConcurrency: cfg.BuildConcurrency,
 			HealthTimeout:    cfg.HealthTimeout,
 			StopGrace:        cfg.StopGrace,
@@ -144,9 +144,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	apiCfg := api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}
-	as := api.New(st, sup, hub, token, apiCfg, slog.Default())
-	dash := web.New(st, sup, hub, token, web.Config{API: apiCfg, HTTPPort: portOf(cfg.HTTPAddr), HTTPS: tlsOn, Version: version}, slog.Default())
+	as := api.New(st, sup, hub, token, api.Config{DataDir: cfg.DataDir, Site: where}, slog.Default())
+	dash := web.New(st, sup, hub, token, web.Config{DataDir: cfg.DataDir, Site: where, Version: version}, slog.Default())
 	// One internal listener: the API under /api/, the dashboard elsewhere.
 	internal := http.NewServeMux()
 	internal.Handle("/api/", as)
@@ -246,16 +245,6 @@ func newDocker(ctx context.Context, cfg config.Config) (*client.Client, error) {
 		slog.Info("docker", "host", docker.DaemonHost())
 	}
 	return docker, nil
-}
-
-// portOf returns the port of a listen address, 0 if it has none.
-func portOf(addr string) int {
-	_, p, err := net.SplitHostPort(addr)
-	if err != nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(p)
-	return n
 }
 
 // newLogger builds the daemon's logger: JSON for machines, text for a

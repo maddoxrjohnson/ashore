@@ -14,20 +14,18 @@ import (
 	"html/template"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
@@ -54,22 +52,9 @@ type Logs interface {
 
 // Config is what the pages need to know about the daemon.
 type Config struct {
-	API      api.Config // data dir (build logs), domain, and the SSH address for remotes
-	HTTPPort int        // the router's port, for the links to apps; 0 or 80 means none shown
-	HTTPS    bool       // link to apps with https
-	Version  string
-}
-
-// AppURL is where an app is reachable through the router.
-func (c Config) AppURL(host string) string {
-	scheme := "http"
-	if c.HTTPS {
-		scheme = "https"
-	}
-	if c.HTTPPort == 0 || c.HTTPPort == 80 || (c.HTTPS && c.HTTPPort == 443) {
-		return scheme + "://" + host
-	}
-	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(c.HTTPPort))
+	DataDir string    // where the builder keeps build logs
+	Site    site.Site // how apps are named and linked
+	Version string
 }
 
 const (
@@ -213,7 +198,7 @@ func (s *Server) apps(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := make([]appRow, 0, len(apps))
 	for _, a := range apps {
-		row := appRow{Name: a.Name, Host: a.Host, URL: s.cfg.AppURL(a.Host), CreatedAt: a.CreatedAt}
+		row := appRow{Name: a.Name, Host: a.Host, URL: s.cfg.Site.AppURL(a.Host), CreatedAt: a.CreatedAt}
 		if a.LiveReleaseID != 0 {
 			if rel, err := s.store.LiveRelease(r.Context(), a.ID); err == nil {
 				row.Live = rel.Name()
@@ -251,7 +236,7 @@ func (s *Server) app(w http.ResponseWriter, r *http.Request) {
 		rel := rels[i]
 		row := releaseRow{Release: rel, Name: rel.Name()}
 		if rel.GitSHA != "" {
-			_, err := os.Stat(buildLogPath(s.cfg.API.DataDir, a.Name, rel.GitSHA))
+			_, err := os.Stat(buildLogPath(s.cfg.DataDir, a.Name, rel.GitSHA))
 			row.HasBuild = err == nil
 		}
 		rows = append(rows, row)
@@ -272,8 +257,8 @@ func (s *Server) app(w http.ResponseWriter, r *http.Request) {
 	}
 	data := map[string]any{
 		"App":      a,
-		"URL":      s.cfg.AppURL(a.Host),
-		"Remote":   s.cfg.API.RemoteURL(a.Name),
+		"URL":      s.cfg.Site.AppURL(a.Host),
+		"Remote":   s.cfg.Site.RemoteURL(a.Name),
 		"Releases": rows,
 		"Config":   cfgVars,
 	}
@@ -310,7 +295,7 @@ func (s *Server) buildLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	data, err := os.ReadFile(buildLogPath(s.cfg.API.DataDir, app, sha))
+	data, err := os.ReadFile(buildLogPath(s.cfg.DataDir, app, sha))
 	if errors.Is(err, fs.ErrNotExist) {
 		http.Error(w, "no build log for "+sha, http.StatusNotFound)
 		return

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -50,7 +50,7 @@ func newFixture(t *testing.T) *fixture {
 	hub := logs.New(dataDir, nil, nil)
 	t.Cleanup(func() { _ = hub.Close() })
 	f := &fixture{store: st, hub: hub, sup: &fakeSup{status: map[string]supervisor.Status{}}, dataDir: dataDir}
-	cfg := Config{API: api.Config{DataDir: dataDir, Domain: "localhost", SSHAddr: "127.0.0.1:2222"}, HTTPPort: 8080, Version: "test"}
+	cfg := Config{DataDir: dataDir, Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222", HTTPPort: 8080}, Version: "test"}
 	f.server = httptest.NewServer(New(st, f.sup, hub, token, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(f.server.Close)
 	jar, _ := cookiejar.New(nil)
@@ -237,22 +237,5 @@ func TestLogStream(t *testing.T) {
 	}
 	if fr := frame(); fr != "event: done\ndata: \n" {
 		t.Fatalf("after forget %q", fr)
-	}
-}
-
-func TestAppURL(t *testing.T) {
-	for _, tc := range []struct {
-		cfg  Config
-		want string
-	}{
-		{Config{HTTPPort: 8080}, "http://a.localhost:8080"},
-		{Config{HTTPPort: 80}, "http://a.localhost"},
-		{Config{}, "http://a.localhost"},
-		{Config{HTTPS: true, HTTPPort: 443}, "https://a.localhost"},
-		{Config{HTTPS: true, HTTPPort: 8443}, "https://a.localhost:8443"},
-	} {
-		if got := tc.cfg.AppURL("a.localhost"); got != tc.want {
-			t.Errorf("%+v: %q, want %q", tc.cfg, got, tc.want)
-		}
 	}
 }

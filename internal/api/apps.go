@@ -26,7 +26,7 @@ type App struct {
 }
 
 func (s *Server) appInfo(a store.App, live string) App {
-	return App{Name: a.Name, Host: a.Host, Remote: s.cfg.RemoteURL(a.Name), Live: live, CreatedAt: a.CreatedAt}
+	return App{Name: a.Name, Host: a.Host, Remote: s.cfg.Site.RemoteURL(a.Name), Live: live, CreatedAt: a.CreatedAt}
 }
 
 // liveName is the app's live release name, or "" when nothing is live.
@@ -89,7 +89,7 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
 		return
 	}
-	a, err := s.store.CreateApp(r.Context(), req.Name, req.Name+"."+s.cfg.Domain)
+	a, err := s.store.CreateApp(r.Context(), req.Name, s.cfg.Site.AppHost(req.Name))
 	if err != nil {
 		s.fail(w, err)
 		return

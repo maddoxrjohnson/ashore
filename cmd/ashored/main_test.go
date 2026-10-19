@@ -10,14 +10,6 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/config"
 )
 
-func TestPortOf(t *testing.T) {
-	for in, want := range map[string]int{":8080": 8080, "127.0.0.1:80": 80, "nope": 0} {
-		if got := portOf(in); got != want {
-			t.Errorf("portOf(%q) = %d, want %d", in, got, want)
-		}
-	}
-}
-
 func TestNewLogger(t *testing.T) {
 	cases := []struct {
 		name   string

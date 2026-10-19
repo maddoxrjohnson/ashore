@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
@@ -105,7 +106,7 @@ func newFixture(t *testing.T) *fixture {
 	f.dataDir = t.TempDir()
 	f.hub = logs.New(f.dataDir, nil, nil)
 	t.Cleanup(func() { _ = f.hub.Close() })
-	f.server = httptest.NewServer(New(st, f.sup, f.hub, token, Config{DataDir: f.dataDir, Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
+	f.server = httptest.NewServer(New(st, f.sup, f.hub, token, Config{DataDir: f.dataDir, Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(f.server.Close)
 	f.client = &Client{URL: f.server.URL, Token: token, HTTP: f.server.Client()}

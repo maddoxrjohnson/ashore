@@ -23,6 +23,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/router"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
@@ -286,7 +287,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	if cfg.ContainerPort == 0 {
 		cfg.ContainerPort = 8080 // the Docker shape; host networking is tested on its own
 	}
-	cfg.DataDir, cfg.Domain, cfg.HTTPPort = t.TempDir(), "localhost", 8080
+	cfg.DataDir, cfg.Site = t.TempDir(), site.Site{Domain: "localhost", HTTPPort: 8080}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
 	f.logs = logs.New(cfg.DataDir, f.runtime, log)

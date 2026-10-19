@@ -21,6 +21,7 @@ import (
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/serve"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
@@ -48,22 +49,8 @@ type Logs interface {
 
 // Config is what the API needs to know about the daemon it fronts.
 type Config struct {
-	DataDir string // where app repositories are created and removed
-	Domain  string // apps are <name>.<Domain>
-	SSHAddr string // the git listener, for the remote URL apps:create prints
-}
-
-// RemoteURL is the git remote a pusher adds for app: the SSH listener's
-// host and port, or the domain when it listens on every interface.
-func (c Config) RemoteURL(app string) string {
-	host, port, err := net.SplitHostPort(c.SSHAddr)
-	if err != nil {
-		return "ssh://ashore@" + c.Domain + "/" + app
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = c.Domain
-	}
-	return "ssh://ashore@" + net.JoinHostPort(host, port) + "/" + app
+	DataDir string    // where app repositories are created and removed
+	Site    site.Site // how apps are named and reached
 }
 
 // Supervisor is what the API asks the deploy machinery to do and to report.

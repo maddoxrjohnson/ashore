@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +31,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/manifest"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
@@ -104,12 +104,8 @@ const (
 // Config is what a deploy needs to know about its surroundings.
 type Config struct {
 	DataDir string
-	// Domain, HTTPPort and HTTPS make the URL printed when a release goes
-	// live: https://<host> when the router serves TLS, otherwise http with
-	// the port unless it is 80.
-	Domain   string
-	HTTPPort int
-	HTTPS    bool
+	// Site makes the URL printed when a release goes live.
+	Site site.Site
 	// BuildConcurrency caps builds in flight across all apps.
 	BuildConcurrency int
 	// HealthTimeout is how long a new instance has to pass its health
@@ -803,7 +799,7 @@ func (a *actor) launchAndSwap(cmd deployCmd, app store.App, rel store.Release, o
 	go a.watch(s.ctx, inst)
 	s.Metrics.Stage(stageSwap, time.Since(swapStart))
 	s.log.Info("route swapped", "app", a.name, "release", rel.Name(), "addr", inst.Addr)
-	_, _ = fmt.Fprintf(out, "-----> live at %s\n", s.url(app.Host))
+	_, _ = fmt.Fprintf(out, "-----> live at %s\n", s.cfg.Site.AppURL(app.Host))
 
 	if old != nil && !old.exited {
 		a.retire(old)
@@ -1044,15 +1040,4 @@ func (a *actor) tail(ctx context.Context, id string, out io.Writer) {
 			_, _ = fmt.Fprintf(out, "       %s\n", l)
 		}
 	}
-}
-
-// url is where the app is reachable through the router.
-func (s *Supervisor) url(host string) string {
-	if s.cfg.HTTPS {
-		return "https://" + host
-	}
-	if s.cfg.HTTPPort == 80 || s.cfg.HTTPPort == 0 {
-		return "http://" + host
-	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(s.cfg.HTTPPort))
 }

@@ -20,6 +20,7 @@ import (
 
 	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/site"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -82,7 +83,7 @@ func newHarness(t *testing.T) *harness {
 	hub := logs.New(t.TempDir(), nil, nil)
 	t.Cleanup(func() { _ = hub.Close() })
 	srv := httptest.NewServer(api.New(st, &fakeSup{}, hub, token,
-		api.Config{DataDir: t.TempDir(), Domain: "localhost", SSHAddr: "127.0.0.1:2222"},
+		api.Config{DataDir: t.TempDir(), Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(srv.Close)
 	return &harness{t: t, server: srv, hub: hub, env: map[string]string{"ASHORE_CONFIG": filepath.Join(t.TempDir(), "config")}}
