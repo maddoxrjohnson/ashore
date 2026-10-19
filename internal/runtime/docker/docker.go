@@ -55,8 +55,8 @@ var loopback = netip.AddrFrom4([4]byte{127, 0, 0, 1})
 // it running. A container that was created but would not start is removed
 // so a failed deploy leaves nothing behind.
 func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, error) {
-	if s.HostPort < 1 || s.HostPort > 65535 {
-		return runtime.Instance{}, fmt.Errorf("start %s %s: host port %d out of range", s.App, s.Release, s.HostPort)
+	if err := s.Validate(); err != nil {
+		return runtime.Instance{}, err
 	}
 	if s.ContainerPort < 1 || s.ContainerPort > 65535 {
 		return runtime.Instance{}, fmt.Errorf("start %s %s: container port %d out of range", s.App, s.Release, s.ContainerPort)

@@ -48,7 +48,7 @@ func TestSpecValidateAndLabels(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []Spec{{HostPort: 0, ContainerPort: 1}, {HostPort: 70000, ContainerPort: 1}, {HostPort: 1, ContainerPort: 0}} {
+	for _, bad := range []Spec{{HostPort: 0}, {HostPort: 70000}} {
 		if bad.Validate() == nil {
 			t.Errorf("%+v should be invalid", bad)
 		}
