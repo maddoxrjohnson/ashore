@@ -75,7 +75,12 @@ func (f *fakeRuntime) Logs(ctx context.Context, _ string, _ time.Time, stdout, s
 
 func newHub(t *testing.T, rt runtime.Runtime) *Hub {
 	t.Helper()
-	h := New(t.TempDir(), rt, nil)
+	return newHubWith(t, rt, Options{})
+}
+
+func newHubWith(t *testing.T, rt runtime.Runtime, o Options) *Hub {
+	t.Helper()
+	h := New(t.TempDir(), rt, o)
 	t.Cleanup(func() { _ = h.Close() })
 	return h
 }
@@ -243,8 +248,7 @@ func TestForgetClosesSubscribersAndRemovesFiles(t *testing.T) {
 }
 
 func TestFileRotation(t *testing.T) {
-	h := newHub(t, &fakeRuntime{})
-	h.RotateAt = 300
+	h := newHubWith(t, &fakeRuntime{}, Options{RotateAt: 300})
 	s := h.Sink("hello")
 	line := strings.Repeat("y", 50)
 	for i := range 60 {
@@ -287,7 +291,7 @@ func TestFileRotation(t *testing.T) {
 }
 
 func TestHubClose(t *testing.T) {
-	h := New(t.TempDir(), &fakeRuntime{}, nil)
+	h := New(t.TempDir(), &fakeRuntime{}, Options{})
 	s := h.Sink("a")
 	ch, cancel := s.Subscribe(0)
 	defer cancel()
@@ -334,9 +338,8 @@ func (o *countingObserver) Dropped(_ string, n int) {
 }
 
 func TestObserverCountsLinesAndDrops(t *testing.T) {
-	h := newHub(t, &fakeRuntime{})
 	obs := &countingObserver{}
-	h.Observer = obs
+	h := newHubWith(t, &fakeRuntime{}, Options{Observer: obs})
 	s := h.Sink("hello")
 	_, cancel := s.Subscribe(0) // never read
 	defer cancel()

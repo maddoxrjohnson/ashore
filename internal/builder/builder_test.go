@@ -143,7 +143,7 @@ func TestBuildRelaysStream(t *testing.T) {
 		`{"stream":"Successfully tagged ashore/hello:` + sha[:7] + `\n"}`
 	d := &fakeDocker{stream: stream}
 	dataDir := t.TempDir()
-	b := New(d, dataDir, time.Minute)
+	b := New(d, dataDir, time.Minute, nil)
 	b.Labels = map[string]string{"ashore.test": "1"}
 
 	var out strings.Builder
@@ -201,7 +201,7 @@ func TestBuildFailures(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir := t.TempDir()
-			b := New(tc.docker, dataDir, 50*time.Millisecond)
+			b := New(tc.docker, dataDir, 50*time.Millisecond, nil)
 			var out strings.Builder
 			tag, err := b.Build(context.Background(), tc.job, &out)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -233,7 +233,7 @@ func TestBuildReadsQuarantine(t *testing.T) {
 	quarantine := filepath.Join(src, "objects")
 
 	d := &fakeDocker{stream: `{"stream":"ok\n"}`}
-	b := New(d, t.TempDir(), time.Minute)
+	b := New(d, t.TempDir(), time.Minute, nil)
 	if _, err := b.Build(context.Background(), Job{App: "hello", Repo: empty, SHA: sha}, io.Discard); err == nil || !strings.Contains(err.Error(), "git archive") {
 		t.Fatalf("build without the quarantine: err = %v, want git archive to fail", err)
 	}
@@ -290,7 +290,7 @@ func TestBuildHelloGoWithDocker(t *testing.T) {
 			}
 		}
 	})
-	b := New(cli, dataDir, 10*time.Minute)
+	b := New(cli, dataDir, 10*time.Minute, nil)
 	b.Labels = map[string]string{"ashore.test": "1"}
 
 	repo, sha := newRepo(t, exampleFiles(t))

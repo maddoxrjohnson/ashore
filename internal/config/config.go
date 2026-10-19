@@ -1,8 +1,12 @@
+// Package config reads the daemon's settings from ASHORE_* environment
+// variables, with defaults for everything and validation that names the
+// variable at fault.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -65,6 +69,16 @@ func Default() Config {
 		LogLevel:         slog.LevelInfo,
 		LogFormat:        LogFormatJSON,
 	}
+}
+
+// Logger builds the daemon's logger as configured: JSON for machines, text
+// for a terminal, at LogLevel. Config values themselves are never logged.
+func (c Config) Logger(w io.Writer) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: c.LogLevel}
+	if c.LogFormat == LogFormatText {
+		return slog.New(slog.NewTextHandler(w, opts))
+	}
+	return slog.New(slog.NewJSONHandler(w, opts))
 }
 
 // Load reads ASHORE_* from the process environment.

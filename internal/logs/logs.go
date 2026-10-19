@@ -62,17 +62,21 @@ type noObserver struct{}
 func (noObserver) Line(string)         {}
 func (noObserver) Dropped(string, int) {}
 
+// Options configure a Hub. The zero value rotates files at 50 MB, counts
+// nothing, and logs through the default logger.
+type Options struct {
+	Log      *slog.Logger
+	Observer Observer // told about lines and drops; nil discards
+	RotateAt int64    // the file size that triggers rotation; 0 means the default
+}
+
 // Hub owns one Sink per app and runs the collectors. Create it with New.
 type Hub struct {
-	dir string // <dataDir>/logs
-	rt  runtime.Runtime
-	log *slog.Logger
-
-	// RotateAt is the file size that triggers rotation. Set before use.
-	RotateAt int64
-	// Observer is told about lines and drops. Set before the first sink
-	// is made; the default discards.
-	Observer Observer
+	dir      string // <dataDir>/logs
+	rt       runtime.Runtime
+	log      *slog.Logger
+	rotateAt int64
+	obs      Observer
 
 	mu     sync.Mutex
 	apps   map[string]*Sink
@@ -80,12 +84,18 @@ type Hub struct {
 }
 
 // New returns a hub that writes under <dataDir>/logs and reads instance
-// output from rt. A nil logger means slog.Default.
-func New(dataDir string, rt runtime.Runtime, log *slog.Logger) *Hub {
-	if log == nil {
-		log = slog.Default()
+// output from rt.
+func New(dataDir string, rt runtime.Runtime, o Options) *Hub {
+	if o.Log == nil {
+		o.Log = slog.Default()
 	}
-	return &Hub{dir: filepath.Join(dataDir, "logs"), rt: rt, log: log, RotateAt: defaultRotateAt, Observer: noObserver{}, apps: make(map[string]*Sink)}
+	if o.Observer == nil {
+		o.Observer = noObserver{}
+	}
+	if o.RotateAt <= 0 {
+		o.RotateAt = defaultRotateAt
+	}
+	return &Hub{dir: filepath.Join(dataDir, "logs"), rt: rt, log: o.Log, rotateAt: o.RotateAt, obs: o.Observer, apps: make(map[string]*Sink)}
 }
 
 // Sink returns the app's sink, creating it on first use. A sink whose file
@@ -97,9 +107,9 @@ func (h *Hub) Sink(app string) *Sink {
 	if s, ok := h.apps[app]; ok {
 		return s
 	}
-	s := &Sink{app: app, dir: filepath.Join(h.dir, app), obs: h.Observer, log: h.log, ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
+	s := &Sink{app: app, dir: filepath.Join(h.dir, app), obs: h.obs, log: h.log, ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
 	if !h.closed {
-		f, err := openRotating(filepath.Join(s.dir, "current.log"), h.RotateAt)
+		f, err := openRotating(filepath.Join(s.dir, "current.log"), h.rotateAt)
 		if err != nil {
 			h.log.Error("open log file", "app", app, "err", err)
 		}

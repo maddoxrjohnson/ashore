@@ -80,7 +80,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	hub := logs.New(t.TempDir(), nil, nil)
+	hub := logs.New(t.TempDir(), nil, logs.Options{})
 	t.Cleanup(func() { _ = hub.Close() })
 	srv := httptest.NewServer(api.New(st, &fakeSup{}, hub, token,
 		api.Config{DataDir: t.TempDir(), Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222"}},

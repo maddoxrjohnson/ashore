@@ -51,6 +51,7 @@ type Server struct {
 	deployer Deployer
 	dataDir  string // absolute, symlinks resolved, for the quarantine check
 	sock     string
+	log      *slog.Logger
 
 	mu     sync.Mutex
 	nonces map[string]string // nonce -> app it was issued for
@@ -62,7 +63,11 @@ func SocketPath(dataDir string) string {
 }
 
 // NewServer prepares the server for a data directory that already exists.
-func NewServer(dataDir string, d Deployer) (*Server, error) {
+// A nil logger means slog.Default.
+func NewServer(dataDir string, d Deployer, log *slog.Logger) (*Server, error) {
+	if log == nil {
+		log = slog.Default()
+	}
 	abs, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
@@ -78,6 +83,7 @@ func NewServer(dataDir string, d Deployer) (*Server, error) {
 		deployer: d,
 		dataDir:  real,
 		sock:     SocketPath(real),
+		log:      log,
 		nonces:   make(map[string]string),
 	}, nil
 }
@@ -147,7 +153,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) handle(ctx context.Context, c net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("hook panic", "panic", r, "stack", string(debug.Stack()))
+			s.log.Error("hook panic", "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
 	defer func() { _ = c.Close() }()
@@ -157,7 +163,7 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 		err = s.check(&req)
 	}
 	if err != nil {
-		slog.Warn("hook refused", "app", req.App, "err", err)
+		s.log.Warn("hook refused", "app", req.App, "err", err)
 		refuse(c, err.Error())
 		return
 	}
@@ -174,17 +180,17 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 	}()
 
 	start := time.Now()
-	slog.Info("hook connected", "app", req.App, "sha", req.SHA)
+	s.log.Info("hook connected", "app", req.App, "sha", req.SHA)
 	lw := newLineWriter(c)
 	err = s.deployer.Deploy(ctx, req.App, req.SHA, req.Quarantine, lw)
 	_ = lw.Flush()
 	if err != nil {
-		slog.Warn("deploy failed", "app", req.App, "sha", req.SHA, "err", err, "duration", time.Since(start))
+		s.log.Warn("deploy failed", "app", req.App, "sha", req.SHA, "err", err, "duration", time.Since(start))
 		_ = writeLine(c, bandOutput, "-----> deploy failed: "+err.Error())
 		_ = writeLine(c, bandStatus, "1")
 		return
 	}
-	slog.Info("deploy finished", "app", req.App, "sha", req.SHA, "duration", time.Since(start))
+	s.log.Info("deploy finished", "app", req.App, "sha", req.SHA, "duration", time.Since(start))
 	_ = writeLine(c, bandStatus, "0")
 }
 

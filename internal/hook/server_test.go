@@ -72,7 +72,7 @@ func (d *fakeDeployer) callList() []deployCall {
 func startServer(t *testing.T, d *fakeDeployer) *Server {
 	t.Helper()
 	dataDir := t.TempDir() // under /tmp: short enough for sun_path
-	s, err := NewServer(dataDir, d)
+	s, err := NewServer(dataDir, d, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func rawCall(t *testing.T, sock, body string) []string {
 
 func TestListen(t *testing.T) {
 	dataDir := t.TempDir()
-	s, err := NewServer(dataDir, &fakeDeployer{})
+	s, err := NewServer(dataDir, &fakeDeployer{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestListen(t *testing.T) {
 }
 
 func TestIssueAndRedeem(t *testing.T) {
-	s, err := NewServer(t.TempDir(), &fakeDeployer{})
+	s, err := NewServer(t.TempDir(), &fakeDeployer{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestHookGoneCancelsDeploy(t *testing.T) {
 
 func TestServeStopsWithActiveDeploy(t *testing.T) {
 	d := &fakeDeployer{block: true, done: make(chan error, 1)}
-	s, err := NewServer(t.TempDir(), d)
+	s, err := NewServer(t.TempDir(), d, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

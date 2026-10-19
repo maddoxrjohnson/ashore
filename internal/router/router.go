@@ -54,14 +54,20 @@ type Observer interface {
 	UpstreamError(app string)
 }
 
+// Options configure a Router. The zero value is a plain HTTP router with
+// the default body cap, no rate limit, no TLS, and the default logger.
+type Options struct {
+	Log      *slog.Logger
+	Observer Observer   // sees every request; nil means nobody
+	MaxBody  int64      // the largest request body accepted, in bytes; 0 means DefaultMaxBody
+	RateRPS  int        // requests per second per client IP; 0 means no limit
+	TLS      *TLSConfig // nil means plain HTTP only
+}
+
 // Router routes by host. Create it with New; it is safe for concurrent use.
 type Router struct {
-	// MaxBody is the largest request body accepted, in bytes. Set it
-	// before the first request.
-	MaxBody int64
-	// Observer sees every request; nil means nobody. Set it before the
-	// first request.
-	Observer Observer
+	maxBody  int64
+	observer Observer
 
 	table atomic.Pointer[map[string]backend]
 	mu    sync.Mutex // serializes writers; readers never take it
@@ -76,13 +82,21 @@ type Router struct {
 // ctxKey carries the backend ServeHTTP chose into the proxy's Rewrite.
 type ctxKey struct{}
 
-// New returns a router with an empty table. A nil logger means slog.Default.
-func New(log *slog.Logger) *Router {
+// New returns a router with an empty table.
+func New(o Options) *Router {
+	log := o.Log
 	if log == nil {
 		log = slog.Default()
 	}
-	r := &Router{MaxBody: DefaultMaxBody, log: log}
+	if o.MaxBody <= 0 {
+		o.MaxBody = DefaultMaxBody
+	}
+	r := &Router{maxBody: o.MaxBody, observer: o.Observer, log: log}
 	r.table.Store(&map[string]backend{})
+	r.SetRateLimit(o.RateRPS)
+	if o.TLS != nil {
+		r.EnableTLS(*o.TLS)
+	}
 	r.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			b := pr.In.Context().Value(ctxKey{}).(backend)
@@ -169,15 +183,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// cheapest request to flood with.
 	case ok:
 		req.Header.Set("X-Request-Id", id) // the proxy clones headers into the outbound request
-		req.Body = http.MaxBytesReader(w, req.Body, r.MaxBody)
+		req.Body = http.MaxBytesReader(w, req.Body, r.maxBody)
 		r.proxy.ServeHTTP(rw, req.WithContext(context.WithValue(req.Context(), ctxKey{}, b)))
 	default:
 		http.Error(rw, fmt.Sprintf("no app at %s (request %s)", host, id), http.StatusNotFound)
 	}
 
 	elapsed := time.Since(start)
-	if r.Observer != nil {
-		r.Observer.Request(b.app, rw.Status, elapsed)
+	if r.observer != nil {
+		r.observer.Request(b.app, rw.Status, elapsed)
 	}
 	r.log.Info("http", "host", host, "app", b.app, "method", req.Method, "path", req.URL.Path,
 		"status", rw.Status, "bytes", rw.Bytes, "duration", elapsed,
@@ -188,8 +202,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // the body so a user can quote it and the operator can grep for it.
 func (r *Router) upstreamError(w http.ResponseWriter, req *http.Request, err error) {
 	id := w.Header().Get("X-Request-Id")
-	if r.Observer != nil {
-		r.Observer.UpstreamError(req.Context().Value(ctxKey{}).(backend).app)
+	if r.observer != nil {
+		r.observer.UpstreamError(req.Context().Value(ctxKey{}).(backend).app)
 	}
 	var tooBig *http.MaxBytesError
 	switch {

@@ -75,7 +75,7 @@ func newTestServer(t *testing.T) (*testServer, context.Context, context.CancelFu
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	hooks := &fakeHooks{}
-	srv, err := New(st, hooks, dataDir, filepath.Join(dataDir, "host_ed25519"))
+	srv, err := New(st, hooks, dataDir, filepath.Join(dataDir, "host_ed25519"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func (ts *testServer) clientConfig(signer ssh.Signer) *ssh.ClientConfig {
 	return &ssh.ClientConfig{
 		User:            "ashore",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.FixedHostKey(ts.srv.hostKey),
+		HostKeyCallback: ssh.FixedHostKey(ts.srv.HostKey()),
 		Timeout:         5 * time.Second,
 	}
 }

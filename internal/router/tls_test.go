@@ -93,7 +93,7 @@ func TestRateLimitAnswers429(t *testing.T) {
 }
 
 func TestHTTPRedirectsToHTTPSWhenTLSIsOn(t *testing.T) {
-	r := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	r.EnableTLS(TLSConfig{Email: "ops@example.com", CacheDir: t.TempDir()})
 	srv := httptest.NewServer(r.httpHandler())
 	t.Cleanup(srv.Close)
@@ -154,7 +154,7 @@ func TestHTTPRedirectsToHTTPSWhenTLSIsOn(t *testing.T) {
 }
 
 func TestServeTLS(t *testing.T) {
-	r := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err := r.ServeTLS(context.Background(), nil); err == nil {
 		t.Fatal("ServeTLS without EnableTLS should fail")
 	}

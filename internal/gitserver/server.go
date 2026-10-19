@@ -63,6 +63,7 @@ type Server struct {
 	dataDir string
 	config  *ssh.ServerConfig
 	hostKey ssh.PublicKey
+	log     *slog.Logger
 
 	// Fingerprint is the host key's SHA256 fingerprint, the string ssh shows
 	// a user on first connect.
@@ -73,8 +74,12 @@ type Server struct {
 
 // New loads or creates the host key and prepares the SSH configuration.
 // dataDir holds repos/<app>.git and is made absolute so that git and the
-// hooks never depend on the daemon's working directory.
-func New(st Store, hooks Hooks, dataDir, hostKeyPath string) (*Server, error) {
+// hooks never depend on the daemon's working directory. A nil logger means
+// slog.Default.
+func New(st Store, hooks Hooks, dataDir, hostKeyPath string, log *slog.Logger) (*Server, error) {
+	if log == nil {
+		log = slog.Default()
+	}
 	abs, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
@@ -88,6 +93,7 @@ func New(st Store, hooks Hooks, dataDir, hostKeyPath string) (*Server, error) {
 		hooks:       hooks,
 		dataDir:     abs,
 		hostKey:     signer.PublicKey(),
+		log:         log,
 		Fingerprint: ssh.FingerprintSHA256(signer.PublicKey()),
 	}
 	s.config = &ssh.ServerConfig{
@@ -95,9 +101,13 @@ func New(st Store, hooks Hooks, dataDir, hostKeyPath string) (*Server, error) {
 		ServerVersion:     "SSH-2.0-ashore",
 	}
 	s.config.AddHostKey(signer)
-	slog.Info("ssh host key", "path", hostKeyPath, "fingerprint", s.Fingerprint, "created", created)
+	log.Info("ssh host key", "path", hostKeyPath, "fingerprint", s.Fingerprint, "created", created)
 	return s, nil
 }
+
+// HostKey is the server's public host key, what a client pins in its
+// known_hosts.
+func (s *Server) HostKey() ssh.PublicKey { return s.hostKey }
 
 // authenticate is called by x/crypto/ssh for every key the client offers,
 // once for the query and once for the signed attempt. The lookup is a
@@ -108,7 +118,7 @@ func (s *Server) authenticate(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Pe
 	defer cancel()
 	k, err := s.store.KeyByFingerprint(ctx, fp)
 	if err != nil {
-		slog.Info("ssh auth refused", "remote", conn.RemoteAddr(), "user", conn.User(), "fingerprint", fp, "err", err)
+		s.log.Info("ssh auth refused", "remote", conn.RemoteAddr(), "user", conn.User(), "fingerprint", fp, "err", err)
 		return nil, err
 	}
 	// The fingerprint is a hash of the key; compare the stored key material
@@ -133,13 +143,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // handleConn runs the handshake, then hands every session channel to its own
 // goroutine and rejects any other channel type.
 func (s *Server) handleConn(ctx context.Context, c net.Conn) {
-	defer logPanic("connection")
+	defer s.logPanic("connection")
 	defer func() { _ = c.Close() }()
 
 	_ = c.SetDeadline(time.Now().Add(handshakeTimeout))
 	sconn, chans, reqs, err := ssh.NewServerConn(c, s.config)
 	if err != nil {
-		slog.Info("ssh handshake failed", "remote", c.RemoteAddr(), "err", err)
+		s.log.Info("ssh handshake failed", "remote", c.RemoteAddr(), "err", err)
 		return
 	}
 	_ = c.SetDeadline(time.Time{})
@@ -158,7 +168,7 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 	go ssh.DiscardRequests(reqs) // global requests, i.e. port forwarding: refused
 
 	fp := sconn.Permissions.Extensions[extFingerprint]
-	slog.Info("ssh authenticated", "remote", c.RemoteAddr(), "key", sconn.Permissions.Extensions[extKeyName], "fingerprint", fp)
+	s.log.Info("ssh authenticated", "remote", c.RemoteAddr(), "key", sconn.Permissions.Extensions[extKeyName], "fingerprint", fp)
 
 	var sessions sync.WaitGroup
 	defer sessions.Wait()
@@ -182,7 +192,7 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 // handleSession waits for the one request that starts something. Only exec
 // is accepted; shell, pty-req, env, subsystem and the rest are refused.
 func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan *ssh.Request, fp string) {
-	defer logPanic("session")
+	defer s.logPanic("session")
 	defer func() { _ = ch.Close() }()
 	for req := range reqs {
 		if req.Type != "exec" {
@@ -211,7 +221,7 @@ func (s *Server) exec(ctx context.Context, ch ssh.Channel, command, fp string) {
 	defer s.active.Add(-1)
 	code, err := s.run(ctx, ch, command, fp)
 	if err != nil {
-		slog.Warn("ssh exec refused", "fingerprint", fp, "command", command, "err", err)
+		s.log.Warn("ssh exec refused", "fingerprint", fp, "command", command, "err", err)
 		_, _ = fmt.Fprintf(ch.Stderr(), "ashore: %v\n", err)
 	}
 	_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)}))
@@ -233,7 +243,7 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 	if _, err := os.Stat(repo); err != nil {
 		return 1, fmt.Errorf("app %s: repository missing", app)
 	}
-	slog.Info("git", "service", service, "app", app, "fingerprint", fp)
+	s.log.Info("git", "service", service, "app", app, "fingerprint", fp)
 
 	env := []string{"ASHORE_APP=" + app}
 	if service == "receive-pack" { // only a push runs the hook
@@ -266,7 +276,7 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 	err = cmd.Wait()
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) && !errors.Is(err, exec.ErrWaitDelay) {
-		slog.Error("git wait", "app", app, "err", err)
+		s.log.Error("git wait", "app", app, "err", err)
 		return 1, nil
 	}
 	if code := cmd.ProcessState.ExitCode(); code >= 0 {
@@ -282,8 +292,8 @@ func refuseAll(reqs <-chan *ssh.Request) {
 }
 
 // logPanic keeps one misbehaving connection from taking the daemon down.
-func logPanic(where string) {
+func (s *Server) logPanic(where string) {
 	if r := recover(); r != nil {
-		slog.Error("ssh panic", "where", where, "panic", r, "stack", string(debug.Stack()))
+		s.log.Error("ssh panic", "where", where, "panic", r, "stack", string(debug.Stack()))
 	}
 }

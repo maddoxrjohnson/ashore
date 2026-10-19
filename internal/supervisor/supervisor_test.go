@@ -289,8 +289,8 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	}
 	cfg.DataDir, cfg.Site = t.TempDir(), site.Site{Domain: "localhost", HTTPPort: 8080}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
-	f.logs = logs.New(cfg.DataDir, f.runtime, log)
+	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(router.Options{Log: log}), clock: newFakeClock(), done: make(chan struct{})}
+	f.logs = logs.New(cfg.DataDir, f.runtime, logs.Options{Log: log})
 	t.Cleanup(func() { _ = f.logs.Close() })
 	f.sup = New(Deps{Store: st, Builder: f.builder, Runtime: f.runtime, Router: f.router, Logs: f.logs, Log: log}, cfg)
 	f.sup.clock = f.clock

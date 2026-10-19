@@ -45,15 +45,19 @@ type Builder struct {
 	docker  Docker
 	logDir  string
 	timeout time.Duration
+	log     *slog.Logger
 	// Labels are added to every image built, after the builder's own
 	// ashore.app and ashore.sha. Tests use it to mark images ashore.test=1.
 	Labels map[string]string
 }
 
 // New returns a Builder that logs under <dataDir>/builds and gives each
-// build at most timeout.
-func New(d Docker, dataDir string, timeout time.Duration) *Builder {
-	return &Builder{docker: d, logDir: filepath.Join(dataDir, "builds"), timeout: timeout}
+// build at most timeout. A nil logger means slog.Default.
+func New(d Docker, dataDir string, timeout time.Duration, log *slog.Logger) *Builder {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Builder{docker: d, logDir: filepath.Join(dataDir, "builds"), timeout: timeout, log: log}
 }
 
 // Tag is the image tag a build of app at sha produces.
@@ -84,10 +88,10 @@ func (b *Builder) Build(ctx context.Context, job Job, out io.Writer) (string, er
 			err = fmt.Errorf("%w after %s", errTimeout, b.timeout)
 		}
 		_, _ = fmt.Fprintf(logf, "error: %v\n", err)
-		slog.Warn("build failed", "app", job.App, "sha", job.SHA, "err", err, "duration", time.Since(start))
+		b.log.Warn("build failed", "app", job.App, "sha", job.SHA, "err", err, "duration", time.Since(start))
 		return "", err
 	}
-	slog.Info("build finished", "app", job.App, "sha", job.SHA, "tag", tag, "duration", time.Since(start))
+	b.log.Info("build finished", "app", job.App, "sha", job.SHA, "tag", tag, "duration", time.Since(start))
 	return tag, nil
 }
 
@@ -129,7 +133,7 @@ func (b *Builder) build(ctx context.Context, job Job, tag string, w io.Writer) e
 	if err != nil {
 		return err
 	}
-	slog.Info("image built", "tag", tag, "id", id)
+	b.log.Info("image built", "tag", tag, "id", id)
 	return nil
 }
 

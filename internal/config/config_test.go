@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -155,6 +157,47 @@ func TestValidateHandBuilt(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantVar) {
 				t.Errorf("err = %q, want it to name %s", err, tc.wantVar)
+			}
+		})
+	}
+}
+
+func TestLogger(t *testing.T) {
+	cases := []struct {
+		name   string
+		format string
+		level  slog.Level
+		debug  bool   // log at debug instead of info
+		want   string // substring of the output; empty means nothing is written
+	}{
+		{"json by default", LogFormatJSON, slog.LevelInfo, false, `"msg":"hello"`},
+		{"text on request", LogFormatText, slog.LevelInfo, false, "msg=hello"},
+		{"debug hidden at info", LogFormatJSON, slog.LevelInfo, true, ""},
+		{"debug shown at debug", LogFormatJSON, slog.LevelDebug, true, `"msg":"hello"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.LogFormat, cfg.LogLevel = tc.format, tc.level
+			var buf bytes.Buffer
+			l := cfg.Logger(&buf)
+			if tc.debug {
+				l.Debug("hello", "k", "v")
+			} else {
+				l.Info("hello", "k", "v")
+			}
+			got := buf.String()
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("expected no output, got %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("output %q does not contain %q", got, tc.want)
+			}
+			if tc.format == LogFormatJSON && !json.Valid(buf.Bytes()) {
+				t.Errorf("output is not valid JSON: %q", got)
 			}
 		})
 	}

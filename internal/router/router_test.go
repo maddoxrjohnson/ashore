@@ -59,8 +59,16 @@ func (l *logBuffer) String() string {
 // newRouter returns a router serving on a test server, and its log output.
 func newRouter(t *testing.T) (*Router, *httptest.Server, *logBuffer) {
 	t.Helper()
+	return newRouterWith(t, Options{})
+}
+
+// newRouterWith is newRouter with options; the log always goes to the
+// returned buffer.
+func newRouterWith(t *testing.T, o Options) (*Router, *httptest.Server, *logBuffer) {
+	t.Helper()
 	logs := &logBuffer{}
-	r := New(slog.New(slog.NewTextHandler(logs, nil)))
+	o.Log = slog.New(slog.NewTextHandler(logs, nil))
+	r := New(o)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return r, srv, logs
@@ -192,8 +200,7 @@ func TestRemove(t *testing.T) {
 }
 
 func TestBodyLimit(t *testing.T) {
-	r, srv, _ := newRouter(t)
-	r.MaxBody = 1024
+	r, srv, _ := newRouterWith(t, Options{MaxBody: 1024})
 	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		_, _ = io.Copy(io.Discard, req.Body)
 	}))
@@ -375,9 +382,8 @@ func (o *fakeObserver) UpstreamError(app string) {
 }
 
 func TestObserverSeesEveryRequest(t *testing.T) {
-	r, srv, _ := newRouter(t)
 	obs := &fakeObserver{}
-	r.Observer = obs
+	r, srv, _ := newRouterWith(t, Options{Observer: obs})
 	a := newBackend(t, "a")
 	r.Set("hello.localhost", "hello", addrOf(a))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

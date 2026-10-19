@@ -104,7 +104,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f := &fixture{store: st, sup: &fakeSup{}, app: app}
 	f.dataDir = t.TempDir()
-	f.hub = logs.New(f.dataDir, nil, nil)
+	f.hub = logs.New(f.dataDir, nil, logs.Options{})
 	t.Cleanup(func() { _ = f.hub.Close() })
 	f.server = httptest.NewServer(New(st, f.sup, f.hub, token, Config{DataDir: f.dataDir, Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil))))
@@ -384,9 +384,9 @@ func TestToken(t *testing.T) {
 	if _, err := ReadToken(dir); err == nil {
 		t.Error("ReadToken before the daemon ran succeeded")
 	}
-	tok, err := LoadToken(dir)
-	if err != nil {
-		t.Fatal(err)
+	tok, created, err := LoadToken(dir)
+	if err != nil || !created {
+		t.Fatalf("first LoadToken: %v created=%v", err, created)
 	}
 	if len(tok) != 64 {
 		t.Errorf("token %q is not 32 bytes of hex", tok)
@@ -395,9 +395,9 @@ func TestToken(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("token file mode %v, err %v", info.Mode(), err)
 	}
-	again, err := LoadToken(dir)
-	if err != nil || again != tok {
-		t.Errorf("second LoadToken = %q, %v; want the same token", again, err)
+	again, created, err := LoadToken(dir)
+	if err != nil || again != tok || created {
+		t.Errorf("second LoadToken = %q, created=%v, %v; want the same token", again, created, err)
 	}
 	read, err := ReadToken(dir)
 	if err != nil || read != tok {
@@ -406,7 +406,7 @@ func TestToken(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, TokenFile), []byte("\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadToken(dir); err == nil {
+	if _, _, err := LoadToken(dir); err == nil {
 		t.Error("an empty token file was accepted")
 	}
 }

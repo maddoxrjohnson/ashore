@@ -47,7 +47,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	hub := logs.New(dataDir, nil, nil)
+	hub := logs.New(dataDir, nil, logs.Options{})
 	t.Cleanup(func() { _ = hub.Close() })
 	f := &fixture{store: st, hub: hub, sup: &fakeSup{status: map[string]supervisor.Status{}}, dataDir: dataDir}
 	cfg := Config{DataDir: dataDir, Site: site.Site{Domain: "localhost", SSHAddr: "127.0.0.1:2222", HTTPPort: 8080}, Version: "test"}
