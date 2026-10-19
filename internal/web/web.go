@@ -7,18 +7,12 @@ package web
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"embed"
 	"errors"
 	"html/template"
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -26,7 +20,6 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	"github.com/maddoxrjohnson/ashore/internal/site"
-	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -110,207 +103,6 @@ func New(st Store, sup Supervisor, lg Logs, token string, cfg Config, log *slog.
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
-}
-
-// withSession sends a visitor without a valid session to the login page.
-func (s *Server) withSession(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.loggedIn(r) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		h(w, r)
-	}
-}
-
-func (s *Server) loggedIn(r *http.Request) bool {
-	c, err := r.Cookie(cookieName)
-	if err != nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	exp, ok := s.sessions[c.Value]
-	if !ok {
-		return false
-	}
-	if time.Now().After(exp) {
-		delete(s.sessions, c.Value)
-		return false
-	}
-	return true
-}
-
-// login checks the token in constant time and starts a session. Expired
-// sessions are swept here, the one place the map grows.
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	presented := strings.TrimSpace(r.FormValue("token"))
-	if len(s.token) == 0 || subtle.ConstantTimeCompare([]byte(presented), s.token) != 1 {
-		s.log.Warn("dashboard login refused", "remote", r.RemoteAddr)
-		s.render(w, http.StatusUnauthorized, "login", map[string]any{"Error": "wrong token"})
-		return
-	}
-	id := rand.Text()
-	now := time.Now()
-	s.mu.Lock()
-	for k, exp := range s.sessions {
-		if now.After(exp) {
-			delete(s.sessions, k)
-		}
-	}
-	s.sessions[id] = now.Add(sessionTTL)
-	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: id, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, MaxAge: int(sessionTTL / time.Second)})
-	s.log.Info("dashboard login", "remote", r.RemoteAddr)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(cookieName); err == nil {
-		s.mu.Lock()
-		delete(s.sessions, c.Value)
-		s.mu.Unlock()
-	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
-	http.Redirect(w, r, "/login", http.StatusSeeOther)
-}
-
-func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
-	if s.loggedIn(r) {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	s.render(w, http.StatusOK, "login", nil)
-}
-
-// appRow is one line of the apps page.
-type appRow struct {
-	Name, Host, URL, Live string
-	CreatedAt             time.Time
-}
-
-func (s *Server) apps(w http.ResponseWriter, r *http.Request) {
-	apps, err := s.store.ListApps(r.Context())
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	rows := make([]appRow, 0, len(apps))
-	for _, a := range apps {
-		row := appRow{Name: a.Name, Host: a.Host, URL: s.cfg.Site.AppURL(a.Host), CreatedAt: a.CreatedAt}
-		if a.LiveReleaseID != 0 {
-			if rel, err := s.store.LiveRelease(r.Context(), a.ID); err == nil {
-				row.Live = rel.Name()
-			}
-		}
-		rows = append(rows, row)
-	}
-	s.render(w, http.StatusOK, "apps", map[string]any{"Apps": rows})
-}
-
-// configVar is one config var; the value is in the page but hidden until
-// its reveal button is pressed.
-type configVar struct{ Key, Value string }
-
-// releaseRow is one release on the app page.
-type releaseRow struct {
-	store.Release
-	Name     string
-	HasBuild bool // a build log exists for its commit
-}
-
-func (s *Server) app(w http.ResponseWriter, r *http.Request) {
-	a, err := s.store.GetApp(r.Context(), r.PathValue("app"))
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	rels, err := s.store.ListReleases(r.Context(), a.ID)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	rows := make([]releaseRow, 0, len(rels))
-	for i := len(rels) - 1; i >= 0; i-- { // newest first
-		rel := rels[i]
-		row := releaseRow{Release: rel, Name: rel.Name()}
-		if rel.GitSHA != "" {
-			_, err := os.Stat(buildLogPath(s.cfg.DataDir, a.Name, rel.GitSHA))
-			row.HasBuild = err == nil
-		}
-		rows = append(rows, row)
-	}
-	vars, err := s.store.GetConfig(r.Context(), a.ID)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	keys := make([]string, 0, len(vars))
-	for k := range vars {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	cfgVars := make([]configVar, 0, len(keys))
-	for _, k := range keys {
-		cfgVars = append(cfgVars, configVar{Key: k, Value: vars[k]})
-	}
-	data := map[string]any{
-		"App":      a,
-		"URL":      s.cfg.Site.AppURL(a.Host),
-		"Remote":   s.cfg.Site.RemoteURL(a.Name),
-		"Releases": rows,
-		"Config":   cfgVars,
-	}
-	if st, ok := s.sup.Status(a.Name); ok {
-		data["Status"] = st
-	}
-	s.render(w, http.StatusOK, "app", data)
-}
-
-// appLogs streams the app's lines as server-sent events, the same frames
-// the API sends, on a path the session cookie authorizes: EventSource
-// cannot send a bearer token.
-func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
-	a, err := s.store.GetApp(r.Context(), r.PathValue("app"))
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	st, err := sse.New(w)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	ch, cancel := s.logs.Subscribe(a.Name, logTail)
-	defer cancel()
-	sse.Follow(r.Context(), st, ch)
-}
-
-// buildLog serves one build's log as text. The commit is checked to be
-// hex before it becomes a path component.
-func (s *Server) buildLog(w http.ResponseWriter, r *http.Request) {
-	app, sha := r.PathValue("app"), r.PathValue("sha")
-	if store.ValidateName(app) != nil || !gitcmd.IsObjectName(sha) {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	data, err := os.ReadFile(buildLogPath(s.cfg.DataDir, app, sha))
-	if errors.Is(err, fs.ErrNotExist) {
-		http.Error(w, "no build log for "+sha, http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write(data)
-}
-
-// buildLogPath is where the builder writes a commit's log.
-func buildLogPath(dataDir, app, sha string) string {
-	return filepath.Join(dataDir, "builds", app, sha+".log")
 }
 
 // render executes a page inside the layout.

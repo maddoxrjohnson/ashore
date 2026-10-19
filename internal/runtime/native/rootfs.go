@@ -1,8 +1,5 @@
-// Package native runs instances without Docker at runtime: an image's
-// filesystem is exported once, and each instance is the daemon binary
-// re-executed into new namespaces, where it mounts an overlay over that
-// filesystem, pivots into it, drops its privileges, and execs the app.
-// Docker still builds the image; this package only needs it to export one.
+// Exporting an image's filesystem once, so instances can mount it as their
+// read-only lower layer.
 package native
 
 import (
