@@ -158,6 +158,14 @@ serves the same stream as server-sent events at `GET /api/v1/apps/<app>/logs?tai
 one `line` event per line with the line as JSON, and a `done` event when the app is
 destroyed; the dashboard reads it with `EventSource`.
 
+## Dashboard
+
+The internal listener also serves a small dashboard at `http://127.0.0.1:9000/`: log in
+with the admin token, see the apps, and open one for its instance, releases, config vars
+(masked until revealed), build logs, and a live log view. It is server-rendered
+`html/template` with a few dozen lines of JavaScript for the log stream and the reveal
+buttons, and it is read-only: changes go through the CLI.
+
 ## Daemon restarts
 
 The containers belong to Docker, not to the daemon, so they keep serving while `ashored` is

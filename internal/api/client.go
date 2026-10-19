@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/sse"
 )
 
 // Client calls the API. URL is the daemon's internal address with scheme,
@@ -222,9 +223,9 @@ func readEvents(r io.Reader, fn func(event, data string) error) error {
 			}
 			text := strings.Join(data, "\n")
 			switch event {
-			case eventDone:
+			case sse.EventDone:
 				return nil
-			case eventError:
+			case sse.EventError:
 				return errors.New(text)
 			default:
 				if len(data) > 0 {

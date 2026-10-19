@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
+	"github.com/maddoxrjohnson/ashore/internal/web"
 )
 
 var version = "dev"
@@ -113,7 +115,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	as := api.New(st, sup, hub, token, api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}, slog.Default())
+	apiCfg := api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}
+	as := api.New(st, sup, hub, token, apiCfg, slog.Default())
+	dash := web.New(st, sup, hub, token, web.Config{API: apiCfg, HTTPPort: portOf(cfg.HTTPAddr), Version: version}, slog.Default())
+	// One internal listener: the API under /api/, the dashboard elsewhere.
+	internal := http.NewServeMux()
+	internal.Handle("/api/", as)
+	internal.Handle("/", dash)
 
 	hs, err := hook.NewServer(cfg.DataDir, sup)
 	if err != nil {
@@ -154,7 +162,7 @@ func run() error {
 	g.Go(func() error { return hs.Serve(gctx, hln) })
 	g.Go(func() error { return gs.Serve(gctx, sln) })
 	g.Go(func() error { return rt.Serve(gctx, httpLn) })
-	g.Go(func() error { return as.Serve(gctx, apiLn) })
+	g.Go(func() error { return as.Serve(gctx, apiLn, internal) })
 	g.Go(func() error { return sup.Run(gctx) })
 	g.Go(func() error {
 		<-gctx.Done()

@@ -16,10 +16,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -143,11 +145,15 @@ func (s *Server) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(presented), s.token) == 1
 }
 
-// Serve runs the API on ln until ctx is done, then shuts down with a
-// deadline, the same shape as the router's Serve.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+// Serve runs h on ln until ctx is done, then shuts down with a deadline,
+// the same shape as the router's Serve. h is the whole internal listener's
+// handler, of which this server is the /api/ part; nil means the API alone.
+func (s *Server) Serve(ctx context.Context, ln net.Listener, h http.Handler) error {
+	if h == nil {
+		h = s
+	}
 	srv := &http.Server{
-		Handler:           s,
+		Handler:           h,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
@@ -201,7 +207,7 @@ func (c ConfigChange) Note() string {
 		for k := range c.Set {
 			keys = append(keys, k)
 		}
-		sortStrings(keys)
+		sort.Strings(keys)
 		parts = append(parts, "config:set "+strings.Join(keys, " "))
 	}
 	if len(c.Unset) > 0 {
@@ -235,32 +241,32 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := newStream(w)
+	st, err := sse.New(w)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	if !changed {
-		st.line("-----> nothing changed")
-		st.done()
+		st.Line("-----> nothing changed")
+		st.Done()
 		return
 	}
 	if _, err := s.store.LiveRelease(r.Context(), app.ID); errors.Is(err, store.ErrNotFound) {
-		st.line("-----> saved; nothing is running yet, the next push uses it")
-		st.done()
+		st.Line("-----> saved; nothing is running yet, the next push uses it")
+		st.Done()
 		return
 	} else if err != nil {
-		st.fail(err)
+		st.Fail(err)
 		return
 	}
 	// The deploy outlives a client that hangs up: the config is already
 	// written, and an abandoned redeploy would leave the running release
 	// disagreeing with it. The supervisor's own lifetime still bounds it.
 	if err := s.sup.Redeploy(context.WithoutCancel(r.Context()), app.Name, change.Note(), st); err != nil {
-		st.fail(err)
+		st.Fail(err)
 		return
 	}
-	st.done()
+	st.Done()
 }
 
 // restart streams a restart of the app's live release.
@@ -306,16 +312,16 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 // the final one. The operation gets a context the client cannot cancel: a
 // deploy half done is worse than one the client did not watch to the end.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, op func(ctx context.Context, out io.Writer) error) {
-	st, err := newStream(w)
+	st, err := sse.New(w)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	if err := op(context.WithoutCancel(r.Context()), st); err != nil {
-		st.fail(err)
+		st.Fail(err)
 		return
 	}
-	st.done()
+	st.Done()
 }
 
 // PS is the answer to GET .../ps: the app's instances. One per app today;

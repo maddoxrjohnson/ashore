@@ -1,0 +1,18 @@
+{{define "content"}}
+<h1>Apps</h1>
+{{if .Apps}}
+<table>
+  <tr><th>Name</th><th>Host</th><th>Live</th><th>Created</th></tr>
+  {{range .Apps}}
+  <tr>
+    <td><a href="/apps/{{.Name}}">{{.Name}}</a></td>
+    <td><a href="{{.URL}}">{{.Host}}</a></td>
+    <td>{{if .Live}}{{.Live}}{{else}}-{{end}}</td>
+    <td>{{local .CreatedAt}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p>No apps yet. <code>ashore apps:create &lt;name&gt;</code> makes one.</p>
+{{end}}
+{{end}}

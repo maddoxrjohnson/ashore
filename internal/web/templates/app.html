@@ -1,0 +1,59 @@
+{{define "content"}}
+<h1>{{.App.Name}}</h1>
+<p><a href="{{.URL}}">{{.URL}}</a> &middot; <code>git remote add ashore {{.Remote}}</code></p>
+
+<h2>Instance</h2>
+{{with .Status}}
+<table>
+  <tr><th>Instance</th><th>Release</th><th>State</th><th>Restarts</th><th>Uptime</th><th>Address</th><th>Detail</th></tr>
+  <tr>
+    <td>{{short .Instance}}</td>
+    <td>{{.Release}}</td>
+    <td class="state-{{.State}}">{{.State}}</td>
+    <td>{{.Restarts}}</td>
+    <td>{{if eq .State "running"}}{{since .StartedAt}}{{else}}-{{end}}</td>
+    <td>{{.Addr}}</td>
+    <td>{{.Detail}}</td>
+  </tr>
+</table>
+{{else}}
+<p>Nothing has run since the daemon started.</p>
+{{end}}
+
+<h2>Releases</h2>
+{{if .Releases}}
+<table>
+  <tr><th>Version</th><th>Status</th><th>Created</th><th>Note</th><th>Commit</th><th>Image</th></tr>
+  {{range .Releases}}
+  <tr>
+    <td>{{.Name}}</td>
+    <td class="status-{{.Status}}">{{.Status}}</td>
+    <td>{{local .CreatedAt}}</td>
+    <td>{{.Note}}</td>
+    <td>{{if .GitSHA}}{{if .HasBuild}}<a href="/apps/{{$.App.Name}}/builds/{{.GitSHA}}">{{commit .GitSHA}}</a>{{else}}{{commit .GitSHA}}{{end}}{{else}}-{{end}}</td>
+    <td>{{if .Image}}{{.Image}}{{else}}-{{end}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p>No releases yet. Push to deploy.</p>
+{{end}}
+
+<h2>Config</h2>
+{{if .Config}}
+<table>
+  {{range .Config}}
+  <tr>
+    <td><code>{{.Key}}</code></td>
+    <td><span class="masked" data-value="{{.Value}}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span></td>
+    <td><button type="button" class="reveal">reveal</button></td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p>No config vars.</p>
+{{end}}
+
+<h2>Logs <small id="logs-state">connecting</small></h2>
+<pre id="logs" data-app="{{.App.Name}}"></pre>
+{{end}}

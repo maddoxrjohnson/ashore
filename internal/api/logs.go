@@ -1,12 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/sse"
 )
 
 const (
@@ -48,16 +48,16 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	follow := r.URL.Query().Get("follow") == "1"
 
-	st, err := newStream(w)
+	st, err := sse.New(w)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	if !follow {
 		for _, l := range s.logs.Tail(app.Name, tail) {
-			st.json(eventLine, l)
+			st.JSON(eventLine, l)
 		}
-		st.done()
+		st.Done()
 		return
 	}
 	ch, cancel := s.logs.Subscribe(app.Name, tail)
@@ -68,35 +68,14 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 		select {
 		case l, ok := <-ch:
 			if !ok { // the app was destroyed
-				st.done()
+				st.Done()
 				return
 			}
-			st.json(eventLine, l)
+			st.JSON(eventLine, l)
 		case <-tick.C:
-			st.comment("keepalive")
+			st.Comment("keepalive")
 		case <-r.Context().Done():
 			return
 		}
 	}
-}
-
-// json sends one event whose data is v encoded as JSON.
-func (st *stream) json(name string, v any) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.event(name, string(b))
-}
-
-// comment sends a line the client ignores, to keep the connection warm.
-func (st *stream) comment(text string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if _, err := st.w.Write([]byte(": " + text + "\n\n")); err != nil {
-		return
-	}
-	_ = st.rc.Flush()
 }

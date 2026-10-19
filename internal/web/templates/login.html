@@ -1,0 +1,9 @@
+{{define "content"}}
+<h1>Log in</h1>
+<p>The admin token is in <code>admin.token</code> in the daemon's data directory.</p>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<form method="post" action="/login">
+  <label>Token <input type="password" name="token" autofocus autocomplete="off"></label>
+  <button type="submit">Log in</button>
+</form>
+{{end}}
