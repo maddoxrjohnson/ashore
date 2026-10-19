@@ -9,7 +9,7 @@ import (
 // fakeClock hands out timers the test fires by hand. Each After call is
 // queued with its duration, so a test can wait for the code to ask, check
 // how long it asked for, move the clock, and fire, in that order; that is
-// the only order in which a fake timer is not a race (concepts/23).
+// the only order in which a fake timer is not a race.
 type fakeClock struct {
 	mu     sync.Mutex
 	now    time.Time

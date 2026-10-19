@@ -41,14 +41,3 @@ func LoadToken(dataDir string) (token string, created bool, err error) {
 	}
 	return token, true, nil
 }
-
-// ReadToken reads an existing token file, for commands that run beside the
-// daemon on the same machine.
-func ReadToken(dataDir string) (string, error) {
-	path := filepath.Join(dataDir, TokenFile)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("admin token: %w (has the daemon run once?)", err)
-	}
-	return strings.TrimSpace(string(b)), nil
-}

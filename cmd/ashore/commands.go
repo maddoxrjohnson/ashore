@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/signal"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -194,12 +195,7 @@ func (c *cli) configGet(ctx context.Context, client *api.Client, app string) err
 	if c.json {
 		return c.printJSON(vars)
 	}
-	keys := make([]string, 0, len(vars))
-	for k := range vars {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
 		_, _ = fmt.Fprintf(c.out, "%s=%s\n", k, vars[k])
 	}
 	return nil
@@ -231,11 +227,7 @@ func (c *cli) releaseInfo(ctx context.Context, client *api.Client, app, version 
 	if c.json {
 		return c.printJSON(r)
 	}
-	keys := make([]string, 0, len(r.Config))
-	for k := range r.Config {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(r.Config))
 	return c.table(func(tw *tabwriter.Writer) {
 		_, _ = fmt.Fprintf(tw, "release:\t%s\napp:\t%s\nstatus:\t%s\nimage:\t%s\ncommit:\t%s\ncreated:\t%s\nnote:\t%s\n",
 			r.Version, app, r.Status, r.Image, r.Commit, local(r.CreatedAt), r.Note)

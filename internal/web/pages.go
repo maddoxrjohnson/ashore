@@ -5,10 +5,11 @@ package web
 import (
 	"errors"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
@@ -78,13 +79,8 @@ func (s *Server) app(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	keys := make([]string, 0, len(vars))
-	for k := range vars {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	cfgVars := make([]configVar, 0, len(keys))
-	for _, k := range keys {
+	cfgVars := make([]configVar, 0, len(vars))
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
 		cfgVars = append(cfgVars, configVar{Key: k, Value: vars[k]})
 	}
 	data := map[string]any{

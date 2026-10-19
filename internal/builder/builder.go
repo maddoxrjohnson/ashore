@@ -36,7 +36,7 @@ type Job struct {
 	SHA  string // full object name of the commit
 	// Quarantine is GIT_QUARANTINE_PATH from the push that delivered SHA.
 	// While pre-receive runs, the pushed objects live there and not in
-	// Repo (D23). Empty for a commit the repository already holds.
+	// Repo. Empty for a commit the repository already holds.
 	Quarantine string
 }
 

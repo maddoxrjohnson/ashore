@@ -129,7 +129,7 @@ func setup(spec initSpec) error {
 
 // mountSpecial fills the container's /proc, /sys, /dev, and /tmp, and
 // gives it the host's DNS configuration, since it shares the host's
-// network (D7).
+// network.
 func mountSpecial(spec initSpec) error {
 	m := spec.Merged
 	mount := func(src, dst, typ string, flags uintptr, data string) error {

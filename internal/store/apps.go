@@ -77,23 +77,7 @@ func (s *Store) GetApp(ctx context.Context, name string) (App, error) {
 
 // ListApps returns every app ordered by name.
 func (s *Store) ListApps(ctx context.Context) ([]App, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+appColumns+` FROM apps ORDER BY name`)
-	if err != nil {
-		return nil, fmt.Errorf("list apps: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var apps []App
-	for rows.Next() {
-		a, err := scanApp(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list apps: %w", err)
-		}
-		apps = append(apps, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list apps: %w", err)
-	}
-	return apps, nil
+	return queryAll(ctx, s.db, "list apps", scanApp, `SELECT `+appColumns+` FROM apps ORDER BY name`)
 }
 
 // DeleteApp removes the app row, or returns ErrNotFound if there is none.

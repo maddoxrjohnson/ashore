@@ -101,6 +101,8 @@ func New(st Store, sup Supervisor, lg Logs, token string, cfg Config, log *slog.
 	return s
 }
 
+// ServeHTTP routes to the pages; the session check is per route, since
+// the login page and the static files have none.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }

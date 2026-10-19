@@ -35,7 +35,7 @@ func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	for _, e := range entries {
-		version, err := parseVersion(e.Name())
+		version, err := migrationVersion(e.Name())
 		if err != nil {
 			return err
 		}
@@ -49,8 +49,9 @@ func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 	return nil
 }
 
-// parseVersion returns the number before the first underscore in "0001_init.sql".
-func parseVersion(name string) (int, error) {
+// migrationVersion returns the number before the first underscore in
+// "0001_init.sql".
+func migrationVersion(name string) (int, error) {
 	prefix, _, ok := strings.Cut(name, "_")
 	if !ok {
 		return 0, fmt.Errorf("migrate: %s: no _ after the version number", name)

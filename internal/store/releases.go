@@ -186,47 +186,15 @@ func (s *Store) LiveRelease(ctx context.Context, appID int64) (Release, error) {
 
 // ListReleases returns an app's releases, oldest first.
 func (s *Store) ListReleases(ctx context.Context, appID int64) ([]Release, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+releaseColumns+` FROM releases WHERE app_id = ? ORDER BY version`, appID)
-	if err != nil {
-		return nil, fmt.Errorf("list releases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Release
-	for rows.Next() {
-		r, err := scanRelease(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list releases: %w", err)
-		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list releases: %w", err)
-	}
-	return out, nil
+	return queryAll(ctx, s.db, "list releases", scanRelease, `SELECT `+releaseColumns+` FROM releases WHERE app_id = ? ORDER BY version`, appID)
 }
 
 // OpenReleases returns every release still building or starting, across
 // all apps. After a daemon restart those are deploys that were cut off; the
 // pusher saw the daemon go away and git never moved the ref.
 func (s *Store) OpenReleases(ctx context.Context) ([]Release, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+releaseColumns+` FROM releases WHERE status IN (?, ?) ORDER BY id`,
+	return queryAll(ctx, s.db, "open releases", scanRelease, `SELECT `+releaseColumns+` FROM releases WHERE status IN (?, ?) ORDER BY id`,
 		StatusBuilding, StatusStarting)
-	if err != nil {
-		return nil, fmt.Errorf("open releases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Release
-	for rows.Next() {
-		r, err := scanRelease(rows)
-		if err != nil {
-			return nil, fmt.Errorf("open releases: %w", err)
-		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("open releases: %w", err)
-	}
-	return out, nil
 }
 
 // MarkBuilt records the image a building release produced and moves it to

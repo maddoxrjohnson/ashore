@@ -69,21 +69,5 @@ func (s *Store) KeyByFingerprint(ctx context.Context, fingerprint string) (Key, 
 
 // ListKeys returns every key in the order they were added.
 func (s *Store) ListKeys(ctx context.Context) ([]Key, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+keyColumns+` FROM ssh_keys ORDER BY id`)
-	if err != nil {
-		return nil, fmt.Errorf("list keys: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var keys []Key
-	for rows.Next() {
-		k, err := scanKey(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list keys: %w", err)
-		}
-		keys = append(keys, k)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list keys: %w", err)
-	}
-	return keys, nil
+	return queryAll(ctx, s.db, "list keys", scanKey, `SELECT `+keyColumns+` FROM ssh_keys ORDER BY id`)
 }

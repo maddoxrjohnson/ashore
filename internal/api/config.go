@@ -5,8 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/maddoxrjohnson/ashore/internal/sse"
@@ -41,12 +42,7 @@ type ConfigChange struct {
 func (c ConfigChange) Note() string {
 	var parts []string
 	if len(c.Set) > 0 {
-		keys := make([]string, 0, len(c.Set))
-		for k := range c.Set {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts = append(parts, "config:set "+strings.Join(keys, " "))
+		parts = append(parts, "config:set "+strings.Join(slices.Sorted(maps.Keys(c.Set)), " "))
 	}
 	if len(c.Unset) > 0 {
 		parts = append(parts, "config:unset "+strings.Join(c.Unset, " "))

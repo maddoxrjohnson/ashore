@@ -1,7 +1,8 @@
 // Package runtime defines what ashore needs from whatever runs an app's
 // containers: start one from an image, stop it, wait for it to exit, read
 // its output, and find the ones already running after a daemon restart.
-// internal/runtime/docker implements it on the Docker Engine API.
+// internal/runtime/docker implements it on the Docker Engine API and
+// internal/runtime/native with namespaces and cgroups directly.
 //
 // The package shares its name with the standard library's runtime. Nothing
 // in ashore needs both in one file; if that changes, alias one of them.
@@ -28,7 +29,7 @@ type Spec struct {
 	HostPort int
 	// ContainerPort is the port the app listens on: 8080 inside a Docker
 	// container; equal to HostPort under the native runtime, which shares
-	// the host's network (D7).
+	// the host's network.
 	ContainerPort int
 	Memory        int64   // bytes; 0 means no limit
 	CPU           float64 // CPUs, e.g. 0.5; 0 means no limit

@@ -40,9 +40,9 @@ const (
 const (
 	// RingSize is how many recent lines each app keeps in memory.
 	RingSize = 1000
-	// SubscriberBuffer is how far a live reader may fall behind before it
+	// subscriberBuffer is how far a live reader may fall behind before it
 	// starts losing lines.
-	SubscriberBuffer = 64
+	subscriberBuffer = 64
 	// MaxLine is where a line without a newline is cut, so one runaway app
 	// cannot grow a buffer without bound.
 	MaxLine = 64 << 10
@@ -237,14 +237,14 @@ func (s *Sink) Tail(n int) []Line {
 // Subscribe returns a channel that first delivers the last tail lines and
 // then every line appended from now on, and a function that ends the
 // subscription and closes the channel. The channel's buffer holds the tail
-// plus SubscriberBuffer live lines; a reader that lets it fill loses lines
+// plus 64 live lines; a reader that lets it fill loses lines
 // and then receives one StreamSystem line saying how many. Only the sink
 // closes the channel, so a reader may range over it.
 func (s *Sink) Subscribe(tail int) (<-chan Line, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	preload := s.ring.last(tail)
-	sub := &subscriber{ch: make(chan Line, len(preload)+SubscriberBuffer)}
+	sub := &subscriber{ch: make(chan Line, len(preload)+subscriberBuffer)}
 	for _, l := range preload {
 		sub.ch <- l
 	}

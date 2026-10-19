@@ -147,20 +147,9 @@ func (m Manifest) String() string {
 		check, m.Health.Timeout, m.Process.Memory, m.Process.CPU, m.Process.Grace)
 }
 
-// FromRepo reads ashore.toml from a commit in a bare repository and parses
-// it; a commit without the file is the default manifest and found is false.
-func FromRepo(ctx context.Context, repo, sha, quarantine string, d Defaults) (m Manifest, found bool, err error) {
-	data, found, err := ReadRepo(ctx, repo, sha, quarantine)
-	if err != nil {
-		return Manifest{}, false, err
-	}
-	m, err = Parse(data, d)
-	return m, found, err
-}
-
 // ReadRepo returns the raw ashore.toml of a commit, or found false when the
 // commit has none. quarantine is GIT_QUARANTINE_PATH while a pre-receive
-// hook runs, when the pushed objects are not in the repository yet (D23).
+// hook runs, when the pushed objects are not in the repository yet.
 // The supervisor takes this function as its seam, so its tests supply the
 // file without a repository.
 func ReadRepo(ctx context.Context, repo, sha, quarantine string) (data []byte, found bool, err error) {

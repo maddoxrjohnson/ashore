@@ -175,9 +175,9 @@ func TestSlowSubscriberDropsAndIsTold(t *testing.T) {
 		t.Fatal("Append blocked on a subscriber that never reads")
 	}
 
-	// The reader resumes: it gets the first SubscriberBuffer lines, then
+	// The reader resumes: it gets the first subscriberBuffer lines, then
 	// the marker for the rest, then whatever comes next.
-	for i := 1; i <= SubscriberBuffer; i++ {
+	for i := 1; i <= subscriberBuffer; i++ {
 		if l := <-ch; l.Text != fmt.Sprint(i) {
 			t.Fatalf("line %d: got %q", i, l.Text)
 		}
@@ -189,7 +189,7 @@ func TestSlowSubscriberDropsAndIsTold(t *testing.T) {
 	}
 	s.Append(Line{App: "hello", Text: "201"})
 	marker := <-ch
-	if marker.Stream != StreamSystem || marker.Text != fmt.Sprintf("dropped %d lines", 200-SubscriberBuffer) {
+	if marker.Stream != StreamSystem || marker.Text != fmt.Sprintf("dropped %d lines", 200-subscriberBuffer) {
 		t.Fatalf("marker = %+v", marker)
 	}
 	if l := <-ch; l.Text != "201" {
@@ -209,14 +209,14 @@ func TestTwoSubscribersAreIndependent(t *testing.T) {
 	defer cancelSlow()
 	fast, cancelFast := s.Subscribe(0)
 	defer cancelFast()
-	for i := 1; i <= SubscriberBuffer+10; i++ {
+	for i := 1; i <= subscriberBuffer+10; i++ {
 		s.Append(Line{Text: fmt.Sprint(i)})
 		if l := <-fast; l.Text != fmt.Sprint(i) {
 			t.Fatalf("fast reader got %q at %d", l.Text, i)
 		}
 	}
-	if len(slow) != SubscriberBuffer {
-		t.Fatalf("slow reader holds %d, want %d", len(slow), SubscriberBuffer)
+	if len(slow) != subscriberBuffer {
+		t.Fatalf("slow reader holds %d, want %d", len(slow), subscriberBuffer)
 	}
 }
 
@@ -343,12 +343,12 @@ func TestObserverCountsLinesAndDrops(t *testing.T) {
 	s := h.Sink("hello")
 	_, cancel := s.Subscribe(0) // never read
 	defer cancel()
-	for i := range SubscriberBuffer + 10 {
+	for i := range subscriberBuffer + 10 {
 		s.Append(Line{Text: fmt.Sprint(i)})
 	}
 	obs.mu.Lock()
 	defer obs.mu.Unlock()
-	if obs.lines != SubscriberBuffer+10 || obs.drops != 10 {
+	if obs.lines != subscriberBuffer+10 || obs.drops != 10 {
 		t.Fatalf("lines %d drops %d", obs.lines, obs.drops)
 	}
 }

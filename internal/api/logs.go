@@ -10,9 +10,9 @@ import (
 
 const (
 	// DefaultTail is how many recent lines a logs request gets unless it
-	// says otherwise; MaxTail is the most it can ask for, the ring's size.
+	// says otherwise; maxTail is the most it can ask for, the ring's size.
 	DefaultTail = 100
-	MaxTail     = logs.RingSize
+	maxTail     = logs.RingSize
 )
 
 // appLogs answers GET /api/v1/apps/{app}/logs?tail=N&follow=1 as an event
@@ -37,7 +37,7 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "tail must be a non-negative number")
 			return
 		}
-		tail = min(n, MaxTail)
+		tail = min(n, maxTail)
 	}
 	follow := r.URL.Query().Get("follow") == "1"
 

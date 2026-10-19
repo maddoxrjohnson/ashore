@@ -174,18 +174,28 @@ func TestFromRepo(t *testing.T) {
 	bad := run("rev-parse", "HEAD")
 	repo := filepath.Join(work, ".git")
 
-	m, found, err := FromRepo(ctx, repo, without, "", defaults)
+	m, found, err := fromRepo(ctx, repo, without, "", defaults)
 	if err != nil || found || m != Default(defaults) {
 		t.Errorf("commit without the file: %+v, %v, %v", m, found, err)
 	}
-	m, found, err = FromRepo(ctx, repo, with, "", defaults)
+	m, found, err = fromRepo(ctx, repo, with, "", defaults)
 	if err != nil || !found || m.Health.Path != "/healthz" || m.Process.Memory != 256<<20 {
 		t.Errorf("commit with the file: %+v, %v, %v", m, found, err)
 	}
-	if _, _, err := FromRepo(ctx, repo, bad, "", defaults); err == nil || !strings.Contains(err.Error(), FileName) {
+	if _, _, err := fromRepo(ctx, repo, bad, "", defaults); err == nil || !strings.Contains(err.Error(), FileName) {
 		t.Errorf("bad manifest: %v", err)
 	}
-	if _, _, err := FromRepo(ctx, repo, strings.Repeat("0", 40), "", defaults); err == nil {
+	if _, _, err := fromRepo(ctx, repo, strings.Repeat("0", 40), "", defaults); err == nil {
 		t.Error("unknown commit accepted")
 	}
+}
+
+// fromRepo is ReadRepo followed by Parse, the way the supervisor uses them.
+func fromRepo(ctx context.Context, repo, sha, quarantine string, d Defaults) (Manifest, bool, error) {
+	data, found, err := ReadRepo(ctx, repo, sha, quarantine)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	m, err := Parse(data, d)
+	return m, found, err
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
+// ErrRepoExists reports an InitRepo for an app that already has a repository.
 var ErrRepoExists = errors.New("repository already exists")
 
 // RepoPath is where an app's bare repository lives.

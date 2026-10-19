@@ -57,8 +57,8 @@ type Server struct {
 	nonces map[string]string // nonce -> app it was issued for
 }
 
-// SocketPath is where the daemon listens for its hooks.
-func SocketPath(dataDir string) string {
+// socketPath is where the daemon listens for its hooks.
+func socketPath(dataDir string) string {
 	return filepath.Join(dataDir, "ashore.sock")
 }
 
@@ -82,7 +82,7 @@ func NewServer(dataDir string, d Deployer, log *slog.Logger) (*Server, error) {
 	return &Server{
 		deployer: d,
 		dataDir:  real,
-		sock:     SocketPath(real),
+		sock:     socketPath(real),
 		log:      log,
 		nonces:   make(map[string]string),
 	}, nil
@@ -227,7 +227,7 @@ func readRequest(c net.Conn) (Request, error) {
 // check validates a request in the order that matters: the nonce first,
 // because it binds the app name to a push the SSH server admitted, then the
 // values that become arguments to git. The quarantine path is cleaned and
-// must lie inside the app's own object directory (D23).
+// must lie inside the app's own object directory.
 func (s *Server) check(req *Request) error {
 	if !s.redeem(req.Nonce, req.App) {
 		return errors.New("bad or expired nonce")

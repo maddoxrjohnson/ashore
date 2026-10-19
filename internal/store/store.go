@@ -1,3 +1,6 @@
+// Package store is the daemon's SQLite database: apps, their SSH keys,
+// releases, and config vars, with the schema kept up to date by embedded
+// migrations. Every SQL statement in ashore lives here.
 package store
 
 import (
@@ -12,6 +15,8 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
+// Errors callers match with errors.Is; each is wrapped with what was looked
+// up or attempted.
 var (
 	ErrNotFound          = errors.New("not found")
 	ErrExists            = errors.New("already exists")
@@ -78,6 +83,28 @@ func ValidateName(name string) error {
 		return fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
 	return nil
+}
+
+// queryAll runs a query and scans every row with scan. what names the
+// query in errors ("list apps").
+func queryAll[T any](ctx context.Context, db *sql.DB, what string, scan func(scanner) (T, error), query string, args ...any) ([]T, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	return out, nil
 }
 
 // isUnique reports whether err is a UNIQUE constraint violation, which is how

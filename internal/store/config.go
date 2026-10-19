@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
-	"sort"
+	"slices"
 )
 
 var (
@@ -78,12 +79,7 @@ func (s *Store) UpdateConfig(ctx context.Context, appID int64, set map[string]st
 	defer func() { _ = tx.Rollback() }()
 
 	// Sorted, so two callers with the same change run the same statements.
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(set)) {
 		res, err := tx.ExecContext(ctx, `INSERT INTO config (app_id, key, value) VALUES (?, ?, ?)
 			ON CONFLICT (app_id, key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value`,
 			appID, k, set[k])

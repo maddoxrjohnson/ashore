@@ -381,9 +381,6 @@ func TestReadStream(t *testing.T) {
 
 func TestToken(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := ReadToken(dir); err == nil {
-		t.Error("ReadToken before the daemon ran succeeded")
-	}
 	tok, created, err := LoadToken(dir)
 	if err != nil || !created {
 		t.Fatalf("first LoadToken: %v created=%v", err, created)
@@ -399,9 +396,8 @@ func TestToken(t *testing.T) {
 	if err != nil || again != tok || created {
 		t.Errorf("second LoadToken = %q, created=%v, %v; want the same token", again, created, err)
 	}
-	read, err := ReadToken(dir)
-	if err != nil || read != tok {
-		t.Errorf("ReadToken = %q, %v", read, err)
+	if b, _ := os.ReadFile(filepath.Join(dir, TokenFile)); strings.TrimSpace(string(b)) != tok {
+		t.Errorf("file holds %q, want %q", b, tok)
 	}
 	if err := os.WriteFile(filepath.Join(dir, TokenFile), []byte("\n"), 0o600); err != nil {
 		t.Fatal(err)
