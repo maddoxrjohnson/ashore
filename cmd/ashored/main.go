@@ -26,6 +26,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/metrics"
 	"github.com/maddoxrjohnson/ashore/internal/router"
+	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
 	"github.com/maddoxrjohnson/ashore/internal/runtime/native"
 	"github.com/maddoxrjohnson/ashore/internal/store"
@@ -103,7 +104,16 @@ func run() error {
 	if tlsOn {
 		rt.EnableTLS(router.TLSConfig{Email: cfg.ACMEEmail, CacheDir: filepath.Join(cfg.DataDir, "certs")})
 	}
-	drt := dockerrt.New(docker)
+	// Both runtimes build with Docker; only the native one runs without it.
+	// Docker gives each container its own network, so apps listen on a
+	// fixed port inside; the native runtime shares the host's, so the app
+	// listens on the host port itself.
+	var drt runtime.Runtime = dockerrt.New(docker)
+	containerPort := 8080
+	if cfg.Runtime == config.RuntimeNative {
+		drt = native.New(docker, cfg.DataDir, cfg.CgroupRoot, slog.Default())
+		containerPort = 0
+	}
 	hub := logs.New(cfg.DataDir, drt, slog.Default())
 	hub.Observer = mets
 	defer func() { _ = hub.Close() }()
@@ -117,6 +127,7 @@ func run() error {
 			HealthTimeout:    cfg.HealthTimeout,
 			StopGrace:        cfg.StopGrace,
 			DrainGrace:       cfg.DrainGrace,
+			ContainerPort:    containerPort,
 		}, slog.Default())
 	sup.Metrics = mets
 
@@ -211,7 +222,7 @@ func run() error {
 	}
 	slog.Info("api listening", "addr", apiLn.Addr().String())
 	mets.SetReady(true)
-	slog.Info("ready", "version", version)
+	slog.Info("ready", "version", version, "runtime", cfg.Runtime)
 	return g.Wait()
 }
 

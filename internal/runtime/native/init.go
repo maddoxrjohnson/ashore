@@ -69,6 +69,13 @@ func Init(args []string) int {
 	if err := setup(spec); err != nil {
 		return fail(err)
 	}
+	// The command is looked up on the app's PATH inside the new root, not
+	// on this process's.
+	for _, kv := range spec.Env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			_ = os.Setenv("PATH", v)
+		}
+	}
 	path, err := exec.LookPath(spec.Argv[0])
 	if err != nil {
 		return fail(fmt.Errorf("%s: %w", spec.Argv[0], err))

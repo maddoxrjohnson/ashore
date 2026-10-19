@@ -44,8 +44,9 @@ runtime in WSL2). Eleven distinct bodies means every release answered during the
 the swaps happened; the daemon log shows eleven route swaps and ten old instances stopped
 after the five-second drain. To reproduce:
 
-    ./bin/ashored apps create slowstart
-    # push examples/slowstart once, then:
+    ./bin/ashore apps:create slowstart
+    # push examples/slowstart once, then, with the daemon started with
+    # ASHORE_RATE_LIMIT_RPS=0 (the load loop is one client sending 200 req/s):
     go run ./scripts/loadloop -host slowstart.localhost -rate 200 &
     sh scripts/deploys.sh /path/to/slowstart-checkout 10
     kill -INT %1; wait
@@ -207,6 +208,54 @@ with the admin token, see the apps, and open one for its instance, releases, con
 `html/template` with a few dozen lines of JavaScript for the log stream and the reveal
 buttons, and it is read-only: changes go through the CLI.
 
+## The native runtime
+
+`ASHORE_RUNTIME=native` runs the same images without Docker at runtime. Docker still
+builds them; the daemon then exports an image's filesystem once (`data/rootfs/<id>`)
+and starts each instance as itself, re-executed into new PID, mount, UTS, and IPC
+namespaces. That child mounts an overlay with the image as the read-only lower layer
+and a per-instance upper layer, fills `/proc`, `/sys` (read-only), `/dev` (six device
+nodes), `/tmp`, bind-mounts the host's `resolv.conf` and `hosts`, pivots into the
+overlay, empties its capability sets, sets `no_new_privs`, switches to the image's user
+(or 65534), and execs the app, which is then PID 1 of its own process tree. Limits come
+from a cgroup v2 directory per instance under `ASHORE_CGROUP_ROOT` (default
+`/sys/fs/cgroup/ashore`): `memory.max` with swap off, `cpu.max`, `pids.max`, and the
+instance is created inside its cgroup rather than moved there afterwards. Output goes
+to files the app itself holds open, so the log collector tails them and nothing is
+lost across a daemon restart; `state.json` with the pid and its kernel start time is
+how a restarted daemon finds and adopts its instances.
+
+Without root the daemon still runs the native runtime, rootless: each instance gets a
+user namespace in which the daemon's user is root, which is enough for the mounts and
+the pivot. In that mode there are no cgroup limits, no uid switch (there is no other
+uid to switch to), `/sys` is a read-only bind of the host's, and the device nodes are
+bind-mounted from the host. Everything else is the same code, and the tests run in both
+modes (`sudo go test ./internal/runtime/native/` for the privileged half).
+
+What it does and does not isolate, next to Docker's defaults:
+
+| | Docker (as ashore uses it) | native, root | native, rootless |
+|---|---|---|---|
+| PID, mount, UTS, IPC namespaces | yes | yes | yes |
+| Network namespace | yes (bridge, port published on loopback) | no: host network, app binds `$PORT` on loopback (`HOST=127.0.0.1`) | same |
+| User namespace | no | no | yes (the daemon's uid is root inside) |
+| Memory, CPU, pids limits | yes | yes (cgroup v2) | no |
+| Capabilities | Docker's default set | none | none |
+| `no_new_privs` | yes | yes | yes |
+| seccomp, AppArmor | Docker's defaults | no | no |
+| Runs as | image user, root by default | image user, 65534 by default | the daemon's user |
+
+Host networking is the deliberate v1 cut: it needs no veth pairs, bridges, or NAT, and
+the router only ever dials loopback; the cost is that apps on one host can see each
+other's loopback ports. An app that ignores `HOST` and binds all interfaces is reachable
+on its port from the network, so the firewall in front matters more than under Docker.
+Because the app is PID 1 of its namespace, a SIGTERM it has no handler for is ignored
+by the kernel; `ashore.toml`'s `[process] grace` is how long it gets before SIGKILL,
+exactly as under `docker stop`. The same ten-deploy load test as above, run through the
+native runtime (rootless, in WSL2) on 2026-10-19:
+
+    requests=23767 ok=23767 failed=0 (none) distinct bodies=11 p50=1.08ms p99=2.12ms max=17.9ms
+
 ## Daemon restarts
 
 The containers belong to Docker, not to the daemon, so they keep serving while `ashored` is
@@ -237,7 +286,9 @@ Go 1.27 or newer and make.
 
 Every setting is an environment variable prefixed `ASHORE_`. The full list with defaults is
 in `internal/config/config.go`. A bad value stops the daemon at startup with the variable
-named in the error.
+named in the error. The ones that pick what runs where: `ASHORE_RUNTIME` (`docker` or
+`native`), `ASHORE_CGROUP_ROOT`, `ASHORE_HTTPS_ADDR` with `ASHORE_ACME_EMAIL`, and
+`ASHORE_RATE_LIMIT_RPS`.
 
 ## License
 

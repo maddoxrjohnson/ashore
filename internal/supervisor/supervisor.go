@@ -119,6 +119,10 @@ type Config struct {
 	// DrainGrace is how long a replaced instance keeps running after the
 	// route moved away from it, so requests it was already handling finish.
 	DrainGrace time.Duration
+	// ContainerPort is the port apps listen on inside their container
+	// (8080 under Docker). 0 means the runtime shares the host's network
+	// and the app listens on the host port itself (the native runtime).
+	ContainerPort int
 }
 
 // Crash handling: an instance that exits on its own is restarted after
@@ -145,7 +149,6 @@ func backoff(n int) time.Duration {
 
 // Instance defaults for what ashore.toml leaves out.
 const (
-	containerPort = 8080
 	defaultMemory = 256 << 20
 	defaultCPU    = 1.0
 	healthEvery   = 250 * time.Millisecond // default probe interval
@@ -880,10 +883,14 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 	if err != nil {
 		return runtime.Instance{}, err
 	}
+	appPort := s.cfg.ContainerPort
+	if appPort == 0 {
+		appPort = port
+	}
 	startAt := time.Now()
 	inst, err := s.runtime.Start(ctx, runtime.Spec{
 		App: a.name, Release: rel.Name(), Image: rel.Image, Env: env,
-		HostPort: port, ContainerPort: containerPort,
+		HostPort: port, ContainerPort: appPort,
 		Memory: int64(m.Process.Memory), CPU: float64(m.Process.CPU),
 	})
 	if err != nil {
@@ -893,13 +900,13 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 	s.log.Info("instance started", "app", a.name, "release", rel.Name(), "id", inst.ID, "addr", inst.Addr)
 	a.collect(inst, time.Time{})
 	if m.Health.Path == "" {
-		_, _ = fmt.Fprintf(out, "-----> waiting for %s to listen on port %d\n", rel.Name(), containerPort)
+		_, _ = fmt.Fprintf(out, "-----> waiting for %s to listen on port %d\n", rel.Name(), appPort)
 	} else {
-		_, _ = fmt.Fprintf(out, "-----> waiting for %s to answer GET %s on port %d\n", rel.Name(), m.Health.Path, containerPort)
+		_, _ = fmt.Fprintf(out, "-----> waiting for %s to answer GET %s on port %d\n", rel.Name(), m.Health.Path, appPort)
 	}
 
 	healthAt := time.Now()
-	err = a.waitHealthy(ctx, inst, m.Health, host)
+	err = a.waitHealthy(ctx, inst, m.Health, host, appPort)
 	s.Metrics.Stage(stageHealth, time.Since(healthAt))
 	if err != nil {
 		bg := context.WithoutCancel(ctx)
@@ -917,7 +924,7 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 // waitHealthy probes the instance every h.Interval until a probe passes,
 // the instance exits, h.Timeout passes, or ctx ends. The probe is a TCP
 // connect-and-hold, or GET h.Path expecting 2xx when the manifest names one.
-func (a *actor) waitHealthy(ctx context.Context, inst runtime.Instance, h manifest.Health, host string) error {
+func (a *actor) waitHealthy(ctx context.Context, inst runtime.Instance, h manifest.Health, host string, appPort int) error {
 	s := a.sup
 	timeout, interval := time.Duration(h.Timeout), time.Duration(h.Interval)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -955,7 +962,7 @@ func (a *actor) waitHealthy(ctx context.Context, inst runtime.Instance, h manife
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				if h.Path == "" {
-					return fmt.Errorf("%s did not accept connections on port %d within %s", inst.Release, containerPort, timeout)
+					return fmt.Errorf("%s did not accept connections on port %d within %s", inst.Release, appPort, timeout)
 				}
 				return fmt.Errorf("%s did not answer 2xx on GET %s within %s (last: %s)", inst.Release, h.Path, timeout, last)
 			}

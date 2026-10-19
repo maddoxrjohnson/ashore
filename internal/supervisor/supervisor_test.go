@@ -283,6 +283,9 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	if cfg.StopGrace == 0 {
 		cfg.StopGrace = 10 * time.Second
 	}
+	if cfg.ContainerPort == 0 {
+		cfg.ContainerPort = 8080 // the Docker shape; host networking is tested on its own
+	}
 	cfg.DataDir, cfg.Domain, cfg.HTTPPort = t.TempDir(), "localhost", 8080
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
@@ -1656,5 +1659,21 @@ func TestMetricsAreReported(t *testing.T) {
 	}
 	if len(m.gone) != 1 || m.gone[0] != "hello" {
 		t.Errorf("gone %v", m.gone)
+	}
+}
+
+func TestHostNetworkingTellsTheAppItsHostPort(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.sup.cfg.ContainerPort = 0 // the native runtime: the app binds the host port
+	out, err := f.deploy(context.Background(), "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := f.runtime.started[0]
+	if spec.ContainerPort != spec.HostPort {
+		t.Fatalf("container port %d, host port %d", spec.ContainerPort, spec.HostPort)
+	}
+	if !strings.Contains(out, fmt.Sprintf("waiting for v1 to listen on port %d\n", spec.HostPort)) {
+		t.Fatalf("output names the wrong port:\n%s", out)
 	}
 }

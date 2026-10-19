@@ -152,7 +152,7 @@ func probeImage(t *testing.T) string {
 			probeErr = fmt.Errorf("building probe: %v\n%s", err, out)
 			return
 		}
-		cfg := ImageConfig{Cmd: []string{"/bin/probe"}, Env: []string{"PATH=/bin"}, WorkingDir: "/srv"}
+		cfg := ImageConfig{Cmd: []string{"probe"}, Env: []string{"PATH=/bin"}, WorkingDir: "/srv"} // by name: found on the image's PATH
 		data, _ := jsonMarshal(cfg)
 		_ = os.WriteFile(filepath.Join(dir, configFile), data, 0o644)
 		_ = os.WriteFile(filepath.Join(dir, doneFile), nil, 0o644)
