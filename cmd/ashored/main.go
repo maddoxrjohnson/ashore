@@ -91,6 +91,11 @@ func run() error {
 	mets := metrics.New(version, cfg.Runtime)
 	rt := router.New(slog.Default())
 	rt.Observer = mets
+	rt.SetRateLimit(cfg.RateLimitRPS)
+	tlsOn := cfg.HTTPSAddr != ""
+	if tlsOn {
+		rt.EnableTLS(router.TLSConfig{Email: cfg.ACMEEmail, CacheDir: filepath.Join(cfg.DataDir, "certs")})
+	}
 	drt := dockerrt.New(docker)
 	hub := logs.New(cfg.DataDir, drt, slog.Default())
 	hub.Observer = mets
@@ -100,6 +105,7 @@ func run() error {
 			DataDir:          cfg.DataDir,
 			Domain:           cfg.Domain,
 			HTTPPort:         portOf(cfg.HTTPAddr),
+			HTTPS:            tlsOn,
 			BuildConcurrency: cfg.BuildConcurrency,
 			HealthTimeout:    cfg.HealthTimeout,
 			StopGrace:        cfg.StopGrace,
@@ -122,7 +128,7 @@ func run() error {
 	}
 	apiCfg := api.Config{DataDir: cfg.DataDir, Domain: cfg.Domain, SSHAddr: cfg.SSHAddr}
 	as := api.New(st, sup, hub, token, apiCfg, slog.Default())
-	dash := web.New(st, sup, hub, token, web.Config{API: apiCfg, HTTPPort: portOf(cfg.HTTPAddr), Version: version}, slog.Default())
+	dash := web.New(st, sup, hub, token, web.Config{API: apiCfg, HTTPPort: portOf(cfg.HTTPAddr), HTTPS: tlsOn, Version: version}, slog.Default())
 	// One internal listener: the API under /api/, the dashboard elsewhere.
 	internal := http.NewServeMux()
 	internal.Handle("/api/", as)
@@ -161,6 +167,17 @@ func run() error {
 		_ = httpLn.Close()
 		return fmt.Errorf("internal listen: %w", err)
 	}
+	var httpsLn net.Listener
+	if tlsOn {
+		httpsLn, err = net.Listen("tcp", cfg.HTTPSAddr)
+		if err != nil {
+			_ = hln.Close()
+			_ = sln.Close()
+			_ = httpLn.Close()
+			_ = apiLn.Close()
+			return fmt.Errorf("https listen: %w", err)
+		}
+	}
 
 	// Each Serve returns nil once its context ends and closes its listener
 	// on the way out. The group cancels that context on the first failure,
@@ -169,6 +186,9 @@ func run() error {
 	g.Go(func() error { return hs.Serve(gctx, hln) })
 	g.Go(func() error { return gs.Serve(gctx, sln) })
 	g.Go(func() error { return rt.Serve(gctx, httpLn) })
+	if tlsOn {
+		g.Go(func() error { return rt.ServeTLS(gctx, httpsLn) })
+	}
 	g.Go(func() error { return as.Serve(gctx, apiLn, internal) })
 	g.Go(func() error { return sup.Run(gctx) })
 	g.Go(func() error {
@@ -178,7 +198,10 @@ func run() error {
 	})
 	slog.Info("hook socket", "path", hs.Socket())
 	slog.Info("ssh listening", "addr", sln.Addr().String())
-	slog.Info("http listening", "addr", httpLn.Addr().String(), "domain", cfg.Domain)
+	slog.Info("http listening", "addr", httpLn.Addr().String(), "domain", cfg.Domain, "tls", tlsOn)
+	if tlsOn {
+		slog.Info("https listening", "addr", httpsLn.Addr().String(), "acme_email", cfg.ACMEEmail)
+	}
 	slog.Info("api listening", "addr", apiLn.Addr().String())
 	mets.SetReady(true)
 	slog.Info("ready", "version", version)

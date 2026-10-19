@@ -10,6 +10,7 @@ package router
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 const (
@@ -65,6 +68,10 @@ type Router struct {
 	mu    sync.Mutex // serializes writers; readers never take it
 	proxy *httputil.ReverseProxy
 	log   *slog.Logger
+	limit *limiter // nil: no rate limit
+
+	acme    *autocert.Manager // nil: TLS off
+	tlsConf *tls.Config
 }
 
 // ctxKey carries the backend ServeHTTP chose into the proxy's Rewrite.
@@ -102,6 +109,16 @@ func New(log *slog.Logger) *Router {
 		ErrorLog:      slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	return r
+}
+
+// SetRateLimit caps each client IP at rps requests per second with a burst
+// of twice that; 0 turns the limit off. Set it before the first request.
+func (r *Router) SetRateLimit(rps int) {
+	if rps <= 0 {
+		r.limit = nil
+		return
+	}
+	r.limit = newLimiter(rps, 2*rps)
 }
 
 // Set routes host to addr, a host:port the router can dial, on behalf of
@@ -147,11 +164,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	host := hostOf(req.Host)
 
 	b, ok := (*r.table.Load())[host]
-	if ok {
+	switch {
+	case r.limited(rw, req):
+		// Per client, before the route lookup: an unknown host is the
+		// cheapest request to flood with.
+	case ok:
 		req.Header.Set("X-Request-Id", id) // the proxy clones headers into the outbound request
 		req.Body = http.MaxBytesReader(w, req.Body, r.MaxBody)
 		r.proxy.ServeHTTP(rw, req.WithContext(context.WithValue(req.Context(), ctxKey{}, b)))
-	} else {
+	default:
 		http.Error(rw, fmt.Sprintf("no app at %s (request %s)", host, id), http.StatusNotFound)
 	}
 
@@ -185,11 +206,16 @@ func (r *Router) upstreamError(w http.ResponseWriter, req *http.Request, err err
 	}
 }
 
-// Serve runs an HTTP server on ln until ctx is done, then shuts it down,
-// giving in-flight requests shutdownTimeout to finish.
+// Serve runs the plain HTTP server on ln until ctx is done, then shuts it
+// down, giving in-flight requests shutdownTimeout to finish. With TLS
+// enabled this listener only answers ACME challenges and redirects.
 func (r *Router) Serve(ctx context.Context, ln net.Listener) error {
+	return r.serve(ctx, ln, r.httpHandler(), "http")
+}
+
+func (r *Router) serve(ctx context.Context, ln net.Listener, h http.Handler, name string) error {
 	srv := &http.Server{
-		Handler:           r,
+		Handler:           h,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelWarn),
@@ -198,17 +224,37 @@ func (r *Router) Serve(ctx context.Context, ln net.Listener) error {
 	go func() { errc <- srv.Serve(ln) }()
 	select {
 	case err := <-errc:
-		return fmt.Errorf("http serve: %w", err)
+		return fmt.Errorf("%s serve: %w", name, err)
 	case <-ctx.Done():
 	}
 	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(sctx); err != nil {
-		r.log.Warn("http shutdown", "err", err)
+		r.log.Warn(name+" shutdown", "err", err)
 		_ = srv.Close()
 	}
 	<-errc // Serve has returned ErrServerClosed
 	return nil
+}
+
+// limited refuses the request with a 429 when its client is over the rate
+// limit, and reports whether it did.
+func (r *Router) limited(w http.ResponseWriter, req *http.Request) bool {
+	if r.limit == nil || r.limit.allow(clientIP(req.RemoteAddr), time.Now()) {
+		return false
+	}
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, fmt.Sprintf("too many requests (request %s)", w.Header().Get("X-Request-Id")), http.StatusTooManyRequests)
+	return true
+}
+
+// clientIP is the peer's address without the port, the rate limiter's
+// key. The router is the edge, so X-Forwarded-For is never trusted here.
+func clientIP(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // hostOf normalizes a Host header for the table: no port, no trailing dot,

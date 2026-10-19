@@ -103,9 +103,12 @@ const (
 // Config is what a deploy needs to know about its surroundings.
 type Config struct {
 	DataDir string
-	// Domain and HTTPPort make the URL printed when a release goes live.
+	// Domain, HTTPPort and HTTPS make the URL printed when a release goes
+	// live: https://<host> when the router serves TLS, otherwise http with
+	// the port unless it is 80.
 	Domain   string
 	HTTPPort int
+	HTTPS    bool
 	// BuildConcurrency caps builds in flight across all apps.
 	BuildConcurrency int
 	// HealthTimeout is how long a new instance has to pass its health
@@ -1040,6 +1043,9 @@ func (a *actor) tail(ctx context.Context, id string, out io.Writer) {
 
 // url is where the app is reachable through the router.
 func (s *Supervisor) url(host string) string {
+	if s.cfg.HTTPS {
+		return "https://" + host
+	}
 	if s.cfg.HTTPPort == 80 || s.cfg.HTTPPort == 0 {
 		return "http://" + host
 	}

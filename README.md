@@ -158,6 +158,23 @@ serves the same stream as server-sent events at `GET /api/v1/apps/<app>/logs?tai
 one `line` event per line with the line as JSON, and a `done` event when the app is
 destroyed; the dashboard reads it with `EventSource`.
 
+## HTTPS and the edge
+
+Set `ASHORE_HTTPS_ADDR` (`:443` in production) and `ASHORE_ACME_EMAIL`, and the router
+serves TLS with certificates from Let's Encrypt: the first request for an app's hostname
+triggers an HTTP-01 challenge, which the plain-HTTP listener answers, and the certificate
+is cached under `data/certs`. Only hostnames the router routes can get a certificate, so a
+client that connects by IP and names a host of its choosing cannot spend the issuer's rate
+limit. With TLS on, every other plain-HTTP request is redirected to `https://` with a 308.
+Locally neither variable is set and everything stays plain HTTP.
+
+Every client IP is limited to `ASHORE_RATE_LIMIT_RPS` requests a second (default 100,
+burst twice that, `0` disables) by a token bucket, before the route lookup, so a flood of
+requests for unknown hosts is refused as cheaply as one for a real app; refused requests
+get a 429 with `Retry-After`. Request bodies are capped at 32 MB, the listeners have
+header and idle timeouts, and the client's own `X-Forwarded-*` headers are dropped before
+the router sets its own.
+
 ## Metrics
 
 The internal listener exposes Prometheus metrics at `/metrics` and a readiness check at
