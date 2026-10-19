@@ -15,51 +15,6 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 )
 
-func TestSplitterCarriesPartialLinesAcrossChunks(t *testing.T) {
-	cases := []struct {
-		name   string
-		chunks []string
-		want   []string
-	}{
-		{"one chunk", []string{"a\nb\n"}, []string{"a", "b"}},
-		{"split mid-line", []string{"hel", "lo\nwor", "ld\n"}, []string{"hello", "world"}},
-		{"unterminated final line", []string{"ab", "c\nde"}, []string{"abc", "de"}},
-		{"crlf", []string{"a\r\nb\r\n"}, []string{"a", "b"}},
-		{"empty lines kept", []string{"\n\nx\n"}, []string{"", "", "x"}},
-		{"newline alone in a chunk", []string{"ab", "\n"}, []string{"ab"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var got []string
-			s := newSplitter(func(text string) { got = append(got, text) })
-			for _, c := range tc.chunks {
-				if _, err := io.WriteString(s, c); err != nil {
-					t.Fatal(err)
-				}
-			}
-			s.Flush()
-			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
-				t.Fatalf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestSplitterCutsRunawayLines(t *testing.T) {
-	var got []string
-	s := newSplitter(func(text string) { got = append(got, text) })
-	big := strings.Repeat("x", MaxLine+10)
-	if _, err := io.WriteString(s, big); err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || len(got[0]) != MaxLine {
-		t.Fatalf("got %d lines, first of length %d; want 1 line of %d", len(got), len(got[0]), MaxLine)
-	}
-	if len(s.buf) != 10 {
-		t.Fatalf("%d bytes buffered, want 10", len(s.buf))
-	}
-}
-
 func TestRingWraps(t *testing.T) {
 	r := newRing(3)
 	if r.last(2) != nil {

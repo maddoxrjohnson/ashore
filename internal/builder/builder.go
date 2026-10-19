@@ -13,13 +13,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
+
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 )
 
 // Docker is the slice of the Engine API the builder uses. *client.Client
@@ -57,10 +58,7 @@ func New(d Docker, dataDir string, timeout time.Duration) *Builder {
 
 // Tag is the image tag a build of app at sha produces.
 func Tag(app, sha string) string {
-	if len(sha) > 7 {
-		sha = sha[:7]
-	}
-	return "ashore/" + app + ":" + sha
+	return "ashore/" + app + ":" + gitcmd.ShortSHA(sha)
 }
 
 var errTimeout = errors.New("build timed out")
@@ -144,11 +142,7 @@ func archive(ctx context.Context, job Job) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "git", "--git-dir="+job.Repo, "archive", "--format=tar", job.SHA)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LC_ALL=C"}
-	if job.Quarantine != "" {
-		cmd.Env = append(cmd.Env, "GIT_ALTERNATE_OBJECT_DIRECTORIES="+job.Quarantine)
-	}
+	cmd := gitcmd.Command(ctx, job.Repo, job.Quarantine, "archive", "--format=tar", job.SHA)
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = f, &stderr
 	err = cmd.Run()

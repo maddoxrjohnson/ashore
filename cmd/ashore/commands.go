@@ -14,6 +14,7 @@ import (
 
 	"github.com/maddoxrjohnson/ashore/internal/api"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/runtime"
 )
 
 // dispatch runs one command. Arity is checked here so every command body
@@ -271,16 +272,9 @@ func (c *cli) ps(ctx context.Context, client *api.Client, app string) error {
 			if i.State == "running" && !i.StartedAt.IsZero() {
 				uptime = time.Since(i.StartedAt).Truncate(time.Second).String()
 			}
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", short(i.Instance), orDash(i.Release), i.State, i.Restarts, uptime, orDash(i.Addr), i.Detail)
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", orDash(runtime.Short(i.Instance)), orDash(i.Release), i.State, i.Restarts, uptime, orDash(i.Addr), i.Detail)
 		}
 	})
-}
-
-func short(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return orDash(id)
 }
 
 // keysAdd sends the first line of an authorized_keys-style file.

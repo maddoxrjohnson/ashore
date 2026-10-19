@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
 )
@@ -361,7 +362,7 @@ func TestReadStream(t *testing.T) {
 		{"lines then done", "data: one\n\ndata: two\n\nevent: done\ndata: \n\n", "one\ntwo\n", ""},
 		{"error", "data: one\n\nevent: error\ndata: boom\n\n", "one\n", "boom"},
 		{"multi-line data", "data: a\ndata: b\n\nevent: done\ndata: \n\n", "a\nb\n", ""},
-		{"no verdict", "data: one\n\n", "one\n", ErrStream.Error()},
+		{"no verdict", "data: one\n\n", "one\n", sse.ErrNoVerdict.Error()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -500,16 +501,5 @@ func TestLogsTailAndFollow(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	if resp, err := srv.Client().Do(req); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("no hub: %v %v", resp, err)
-	}
-}
-
-func TestReadEventsSkipsComments(t *testing.T) {
-	var got []string
-	err := readEvents(strings.NewReader(": keepalive\n\nevent: line\ndata: {\"a\":1}\n\n: again\n\nevent: done\ndata: \n\n"), func(event, data string) error {
-		got = append(got, event+"="+data)
-		return nil
-	})
-	if err != nil || len(got) != 1 || got[0] != `line={"a":1}` {
-		t.Fatalf("%v %q", err, got)
 	}
 }

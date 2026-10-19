@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/maddoxrjohnson/ashore/internal/runtime"
 )
 
 // rotatingFile appends lines to path and, when the file reaches rotateAt
@@ -49,7 +51,7 @@ func (r *rotatingFile) open() error {
 // instance, stream, text. The time is UTC with microseconds, so lines from
 // two instances during a deploy sort by the collector's clock.
 func (r *rotatingFile) WriteLine(l Line) error {
-	rec := l.Time.UTC().Format("2006-01-02T15:04:05.000000Z") + " " + orDash(l.Release) + " " + orDash(short(l.Instance)) + " " + l.Stream + " " + l.Text + "\n"
+	rec := l.Time.UTC().Format("2006-01-02T15:04:05.000000Z") + " " + orDash(l.Release) + " " + orDash(runtime.Short(l.Instance)) + " " + l.Stream + " " + l.Text + "\n"
 	if r.size > 0 && r.size+int64(len(rec)) > r.rotateAt {
 		if err := r.rotate(); err != nil {
 			return fmt.Errorf("rotate %s: %w", r.path, err)
@@ -87,12 +89,4 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-// short is the first 12 characters of an instance id, as docker ps shows.
-func short(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }

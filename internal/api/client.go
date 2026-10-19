@@ -1,11 +1,9 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -194,61 +192,15 @@ type Error struct {
 func (e *Error) Error() string { return e.Message }
 
 // readStream copies a progress stream's lines to out until its done or
-// error event. A stream that ends without either is ErrStream.
+// error event. A stream that ends without either is sse.ErrNoVerdict.
 func readStream(r io.Reader, out io.Writer) error {
-	return readEvents(r, func(event, data string) error {
+	return sse.Read(r, func(event, data string) error {
 		if event == "" {
 			_, err := fmt.Fprintln(out, data)
 			return err
 		}
 		return nil
 	})
-}
-
-// readEvents parses server-sent events and calls fn for each one that is
-// neither the done nor the error event; those end the read. An error event
-// is returned as an error; a stream that ends without a verdict is
-// ErrStream. Comment lines are skipped.
-func readEvents(r io.Reader, fn func(event, data string) error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	var event string
-	var data []string
-	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case line == "":
-			if len(data) == 0 && event == "" {
-				continue // a comment's blank line
-			}
-			text := strings.Join(data, "\n")
-			switch event {
-			case sse.EventDone:
-				return nil
-			case sse.EventError:
-				return errors.New(text)
-			default:
-				if len(data) > 0 {
-					if err := fn(event, text); err != nil {
-						return err
-					}
-				}
-			}
-			event, data = "", nil
-		case strings.HasPrefix(line, ":"):
-			// a comment, such as a keepalive
-		case strings.HasPrefix(line, "event: "):
-			event = strings.TrimPrefix(line, "event: ")
-		case strings.HasPrefix(line, "data: "):
-			data = append(data, strings.TrimPrefix(line, "data: "))
-		case strings.HasPrefix(line, "data:"):
-			data = append(data, "")
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
-	}
-	return ErrStream
 }
 
 // Logs reads the app's recent lines and, with follow, keeps reading until
@@ -264,8 +216,8 @@ func (c *Client) Logs(ctx context.Context, app string, tail int, follow bool, fn
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	err = readEvents(resp.Body, func(event, data string) error {
-		if event != eventLine {
+	err = sse.Read(resp.Body, func(event, data string) error {
+		if event != sse.EventLine {
 			return nil
 		}
 		var l logs.Line

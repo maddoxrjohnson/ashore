@@ -99,8 +99,8 @@ func New(d Docker, dataDir, cgroupRoot string, log *slog.Logger) *Runtime {
 // and re-executes the daemon as the container's init. It returns once the
 // child has exec'd the app, or with the child's reason when it could not.
 func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, error) {
-	if s.HostPort < 1 || s.HostPort > 65535 {
-		return runtime.Instance{}, fmt.Errorf("start %s %s: host port %d out of range", s.App, s.Release, s.HostPort)
+	if err := s.Validate(); err != nil {
+		return runtime.Instance{}, err
 	}
 	im, err := r.exporter.Prepare(ctx, s.Image)
 	if err != nil {
@@ -131,12 +131,7 @@ func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, 
 		Argv: argv, Env: environ(im.Config.Env, s.Env, s.HostPort), Dir: im.Config.WorkingDir,
 		UID: uid, GID: gid, Rootless: r.rootless,
 	}
-	labels := make(map[string]string, len(s.Labels)+2)
-	for k, v := range s.Labels {
-		labels[k] = v
-	}
-	labels[runtime.LabelApp], labels[runtime.LabelRelease] = s.App, s.Release
-	st := state{ID: id, App: s.App, Release: s.Release, Image: s.Image, Port: s.HostPort, CreatedAt: time.Now(), Labels: labels}
+	st := state{ID: id, App: s.App, Release: s.Release, Image: s.Image, Port: s.HostPort, CreatedAt: time.Now(), Labels: s.AllLabels()}
 
 	p, err := r.spawn(ctx, dir, spec, &st, s)
 	if err != nil {
@@ -300,7 +295,7 @@ func (r *Runtime) Wait(ctx context.Context, id string) (int, error) {
 	}
 	st, err := readState(filepath.Join(r.dir, id))
 	if err != nil {
-		return -1, fmt.Errorf("wait %s: %w", short(id), runtime.ErrNotFound)
+		return -1, fmt.Errorf("wait %s: %w", runtime.Short(id), runtime.ErrNotFound)
 	}
 	for alive(st) {
 		select {
@@ -320,7 +315,7 @@ func (r *Runtime) Logs(ctx context.Context, id string, since time.Time, stdout, 
 	dir := filepath.Join(r.dir, id)
 	st, err := readState(dir)
 	if err != nil {
-		return fmt.Errorf("logs %s: %w", short(id), runtime.ErrNotFound)
+		return fmt.Errorf("logs %s: %w", runtime.Short(id), runtime.ErrNotFound)
 	}
 	out, err := os.Open(filepath.Join(dir, "stdout.log"))
 	if err != nil {
@@ -419,10 +414,10 @@ func (r *Runtime) Stop(ctx context.Context, id string, grace time.Duration) erro
 	}
 	if r.cg != nil && st.Cgroup != "" {
 		if err := r.cg.remove(st.Cgroup); err != nil {
-			r.log.Warn("remove cgroup", "id", short(id), "err", err)
+			r.log.Warn("remove cgroup", "id", runtime.Short(id), "err", err)
 		}
 	}
-	r.log.Info("native instance stopped", "app", st.App, "id", short(id))
+	r.log.Info("native instance stopped", "app", st.App, "id", runtime.Short(id))
 	return os.RemoveAll(dir)
 }
 
@@ -518,13 +513,6 @@ func newID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func short(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }
 
 func writeState(dir string, st state) error {

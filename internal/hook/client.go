@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 )
 
 // defaultBranch is the only ref a push may update. Anything else is refused
@@ -85,28 +87,13 @@ func parseUpdates(r io.Reader, branch string) (string, error) {
 	if ref != want {
 		return "", fmt.Errorf("only %s deploys; refusing %s", want, ref)
 	}
-	if !isObjectName(newSHA) {
+	if !gitcmd.IsObjectName(newSHA) {
 		return "", fmt.Errorf("bad object name %q", newSHA)
 	}
 	if strings.Trim(newSHA, "0") == "" {
 		return "", fmt.Errorf("refusing to delete %s", want)
 	}
 	return newSHA, nil
-}
-
-// isObjectName accepts a full lowercase hex SHA-1 or SHA-256 object name. The
-// value ends up as a git command argument in the daemon, so nothing else gets
-// through.
-func isObjectName(s string) bool {
-	if len(s) != 40 && len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if !strings.ContainsRune("0123456789abcdef", c) {
-			return false
-		}
-	}
-	return true
 }
 
 // call hands the push to the daemon and relays its answer. Output lines go to

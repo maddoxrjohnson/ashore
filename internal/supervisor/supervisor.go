@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/builder"
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/manifest"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
@@ -621,10 +622,7 @@ func (a *actor) deploy(cmd deployCmd) (err error) {
 	}()
 	s := a.sup
 	ctx, out := cmd.ctx, cmd.out
-	short := cmd.sha
-	if len(short) > 7 {
-		short = short[:7]
-	}
+	short := gitcmd.ShortSHA(cmd.sha)
 
 	app, err := s.store.GetApp(ctx, a.name)
 	if err != nil {

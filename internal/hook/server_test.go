@@ -356,7 +356,7 @@ func TestServeStopsWithActiveDeploy(t *testing.T) {
 
 func TestLineWriter(t *testing.T) {
 	var sb strings.Builder
-	lw := &lineWriter{w: &sb}
+	lw := newLineWriter(&sb)
 	for _, chunk := range []string{"one\ntw", "o\r\n", "three", "", "\nfour"} {
 		if _, err := lw.Write([]byte(chunk)); err != nil {
 			t.Fatal(err)
@@ -371,7 +371,7 @@ func TestLineWriter(t *testing.T) {
 
 	// Output that never ends a line is split so the hook's scanner is not overrun.
 	sb.Reset()
-	lw = &lineWriter{w: &sb}
+	lw = newLineWriter(&sb)
 	if _, err := lw.Write([]byte(strings.Repeat("x", maxLine+1))); err != nil {
 		t.Fatal(err)
 	}

@@ -11,7 +11,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/serve"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
@@ -78,12 +78,7 @@ type Supervisor interface {
 	Status(app string) (st supervisor.Status, ok bool)
 }
 
-const (
-	readHeaderTimeout = 10 * time.Second
-	idleTimeout       = 2 * time.Minute
-	shutdownTimeout   = 10 * time.Second
-	maxBody           = 1 << 20 // config and keys are small
-)
+const maxBody = 1 << 20 // config and keys are small
 
 // Server serves the API. Create it with New.
 type Server struct {
@@ -124,7 +119,7 @@ func New(st Store, sup Supervisor, lg Logs, token string, cfg Config, log *slog.
 // token, including unknown paths, so a scan learns nothing about the routes.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	rw := &recorder{ResponseWriter: w}
+	rw := &serve.Recorder{ResponseWriter: w}
 	if !s.authorized(r) {
 		rw.Header().Set("WWW-Authenticate", `Bearer realm="ashore"`)
 		writeError(rw, http.StatusUnauthorized, "missing or wrong token")
@@ -132,7 +127,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(rw, r.Body, maxBody)
 		s.mux.ServeHTTP(rw, r)
 	}
-	s.log.Info("api", "method", r.Method, "path", r.URL.Path, "status", rw.status, "duration", time.Since(start), "remote", r.RemoteAddr)
+	s.log.Info("api", "method", r.Method, "path", r.URL.Path, "status", rw.Status, "duration", time.Since(start), "remote", r.RemoteAddr)
 }
 
 // authorized compares the bearer token in constant time, so the response
@@ -152,27 +147,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	if h == nil {
 		h = s
 	}
-	srv := &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: readHeaderTimeout,
-		IdleTimeout:       idleTimeout,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
-	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return fmt.Errorf("api serve: %w", err)
-	case <-ctx.Done():
-	}
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
-		s.log.Warn("api shutdown", "err", err)
-		_ = srv.Close()
-	}
-	<-errc
-	return nil
+	return serve.HTTP(ctx, ln, h, "api", s.log)
 }
 
 // getConfig answers with the app's config vars as one JSON object.
@@ -377,25 +352,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-
-// recorder keeps the status for the request log.
-type recorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (rw *recorder) WriteHeader(code int) {
-	if rw.status == 0 {
-		rw.status = code
-	}
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-func (rw *recorder) Write(p []byte) (int, error) {
-	if rw.status == 0 {
-		rw.status = http.StatusOK
-	}
-	return rw.ResponseWriter.Write(p)
-}
-
-func (rw *recorder) Unwrap() http.ResponseWriter { return rw.ResponseWriter }

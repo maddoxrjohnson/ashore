@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/maddoxrjohnson/ashore/internal/serve"
 )
 
 const (
@@ -33,10 +35,7 @@ const (
 	// client that needs more is not one of ours.
 	DefaultMaxBody = 32 << 20
 
-	readHeaderTimeout = 10 * time.Second
-	idleTimeout       = 2 * time.Minute
-	dialTimeout       = 5 * time.Second
-	shutdownTimeout   = 10 * time.Second
+	dialTimeout = 5 * time.Second
 )
 
 // backend is one routing table entry. The URL is built once, at Set, so the
@@ -160,7 +159,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	id := requestID()
 	w.Header().Set("X-Request-Id", id)
-	rw := &recorder{ResponseWriter: w}
+	rw := &serve.Recorder{ResponseWriter: w}
 	host := hostOf(req.Host)
 
 	b, ok := (*r.table.Load())[host]
@@ -178,10 +177,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	elapsed := time.Since(start)
 	if r.Observer != nil {
-		r.Observer.Request(b.app, rw.status, elapsed)
+		r.Observer.Request(b.app, rw.Status, elapsed)
 	}
 	r.log.Info("http", "host", host, "app", b.app, "method", req.Method, "path", req.URL.Path,
-		"status", rw.status, "bytes", rw.bytes, "duration", elapsed,
+		"status", rw.Status, "bytes", rw.Bytes, "duration", elapsed,
 		"id", id, "remote", req.RemoteAddr)
 }
 
@@ -214,27 +213,7 @@ func (r *Router) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (r *Router) serve(ctx context.Context, ln net.Listener, h http.Handler, name string) error {
-	srv := &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: readHeaderTimeout,
-		IdleTimeout:       idleTimeout,
-		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelWarn),
-	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return fmt.Errorf("%s serve: %w", name, err)
-	case <-ctx.Done():
-	}
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
-		r.log.Warn(name+" shutdown", "err", err)
-		_ = srv.Close()
-	}
-	<-errc // Serve has returned ErrServerClosed
-	return nil
+	return serve.HTTP(ctx, ln, h, name, r.log)
 }
 
 // limited refuses the request with a 429 when its client is over the rate
@@ -273,30 +252,3 @@ func requestID() string {
 	_, _ = rand.Read(b[:]) // never fails on supported platforms
 	return hex.EncodeToString(b[:])
 }
-
-// recorder captures the status and size for the access log. Unwrap lets
-// http.ResponseController reach the real writer, which is how the proxy
-// flushes streaming responses and hijacks WebSocket upgrades.
-type recorder struct {
-	http.ResponseWriter
-	status int
-	bytes  int64
-}
-
-func (rw *recorder) WriteHeader(code int) {
-	if rw.status == 0 {
-		rw.status = code
-	}
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-func (rw *recorder) Write(p []byte) (int, error) {
-	if rw.status == 0 {
-		rw.status = http.StatusOK
-	}
-	n, err := rw.ResponseWriter.Write(p)
-	rw.bytes += int64(n)
-	return n, err
-}
-
-func (rw *recorder) Unwrap() http.ResponseWriter { return rw.ResponseWriter }

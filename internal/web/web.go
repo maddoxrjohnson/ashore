@@ -25,7 +25,9 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/api"
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 	"github.com/maddoxrjohnson/ashore/internal/logs"
+	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 	"github.com/maddoxrjohnson/ashore/internal/supervisor"
@@ -74,8 +76,6 @@ const (
 	cookieName = "ashore_session"
 	sessionTTL = 24 * time.Hour
 	logTail    = 100
-	keepalive  = 30 * time.Second
-	eventLine  = "line"
 )
 
 //go:embed templates/*.html static/*
@@ -106,8 +106,8 @@ func New(st Store, sup Supervisor, lg Logs, token string, cfg Config, log *slog.
 	for _, page := range []string{"login", "apps", "app"} {
 		s.pages[page] = template.Must(template.New("").Funcs(template.FuncMap{
 			"local":  func(t time.Time) string { return t.Local().Format(time.DateTime) },
-			"short":  shortID,
-			"commit": func(sha string) string { return shortID(sha)[:min(7, len(sha))] },
+			"short":  runtime.Short,
+			"commit": gitcmd.ShortSHA,
 			"since":  since,
 		}).ParseFS(content, "templates/layout.html", "templates/"+page+".html"))
 	}
@@ -299,29 +299,14 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, cancel := s.logs.Subscribe(a.Name, logTail)
 	defer cancel()
-	tick := time.NewTicker(keepalive)
-	defer tick.Stop()
-	for {
-		select {
-		case l, ok := <-ch:
-			if !ok {
-				st.Done()
-				return
-			}
-			st.JSON(eventLine, l)
-		case <-tick.C:
-			st.Comment("keepalive")
-		case <-r.Context().Done():
-			return
-		}
-	}
+	sse.Follow(r.Context(), st, ch)
 }
 
 // buildLog serves one build's log as text. The commit is checked to be
 // hex before it becomes a path component.
 func (s *Server) buildLog(w http.ResponseWriter, r *http.Request) {
 	app, sha := r.PathValue("app"), r.PathValue("sha")
-	if store.ValidateName(app) != nil || !isHex(sha) || (len(sha) != 40 && len(sha) != 64) {
+	if store.ValidateName(app) != nil || !gitcmd.IsObjectName(sha) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -341,15 +326,6 @@ func (s *Server) buildLog(w http.ResponseWriter, r *http.Request) {
 // buildLogPath is where the builder writes a commit's log.
 func buildLogPath(dataDir, app, sha string) string {
 	return filepath.Join(dataDir, "builds", app, sha+".log")
-}
-
-func isHex(s string) bool {
-	for _, c := range s {
-		if !strings.ContainsRune("0123456789abcdef", c) {
-			return false
-		}
-	}
-	return s != ""
 }
 
 // render executes a page inside the layout.
@@ -373,13 +349,6 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 	}
 	s.log.Error("dashboard error", "err", err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
-}
-
-func shortID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }
 
 // since says how long ago t was, for an instance's uptime.

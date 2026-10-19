@@ -10,6 +10,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -35,6 +36,28 @@ type Spec struct {
 	// Labels are added to the instance after the runtime's own. Tests use
 	// them to mark what they create with ashore.test=1.
 	Labels map[string]string
+}
+
+// Validate reports a Spec no runtime could start: a host port out of
+// range. A runtime that uses ContainerPort checks it itself; one with host
+// networking ignores it.
+func (s Spec) Validate() error {
+	if s.HostPort < 1 || s.HostPort > 65535 {
+		return fmt.Errorf("start %s %s: host port %d out of range", s.App, s.Release, s.HostPort)
+	}
+	return nil
+}
+
+// AllLabels is the caller's labels with the runtime's own added last, so a
+// caller's label cannot hide an instance from List.
+func (s Spec) AllLabels() map[string]string {
+	labels := make(map[string]string, len(s.Labels)+2)
+	for k, v := range s.Labels {
+		labels[k] = v
+	}
+	labels[LabelApp] = s.App
+	labels[LabelRelease] = s.Release
+	return labels
 }
 
 // DefaultPids caps the processes in one instance when Spec.Pids is 0. It
@@ -85,3 +108,12 @@ type Runtime interface {
 
 // ErrNotFound reports an instance id the runtime does not know.
 var ErrNotFound = errors.New("no such instance")
+
+// Short is the first 12 characters of an instance id, the form docker ps
+// shows and the one people read out loud.
+func Short(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}

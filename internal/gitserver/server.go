@@ -24,6 +24,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
+	"github.com/maddoxrjohnson/ashore/internal/serve"
 	"github.com/maddoxrjohnson/ashore/internal/store"
 )
 
@@ -125,28 +127,7 @@ func (s *Server) authenticate(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Pe
 // waits for the connections it spawned. Their git processes are terminated
 // through the same context.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	defer cancel() // runs before wg.Wait, so connections are told to stop first
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("ssh accept: %w", err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handleConn(ctx, c)
-		}()
-	}
+	return serve.Accept(ctx, ln, "ssh", s.handleConn)
 }
 
 // handleConn runs the handshake, then hands every session channel to its own
@@ -261,7 +242,7 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 		env = append(env, "ASHORE_SOCK="+s.hooks.Socket(), "ASHORE_NONCE="+nonce)
 	}
 	cmd := exec.CommandContext(ctx, "git", service, repo)
-	cmd.Env = gitEnv(env...)
+	cmd.Env = gitcmd.Env(env...)
 	cmd.Stdout = ch
 	cmd.Stderr = ch.Stderr()
 	// SIGTERM first so git removes its quarantine directory; Go sends SIGKILL
@@ -292,16 +273,6 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, command, fp string) (i
 		return code, nil
 	}
 	return 1, nil // killed by a signal: the client dropped or the daemon stopped
-}
-
-// gitEnv is the child's entire environment: nothing the client sent, only
-// what git needs from the daemon.
-func gitEnv(extra ...string) []string {
-	env := []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C"}
-	if home := os.Getenv("HOME"); home != "" {
-		env = append(env, "HOME="+home)
-	}
-	return append(env, extra...)
 }
 
 func refuseAll(reqs <-chan *ssh.Request) {

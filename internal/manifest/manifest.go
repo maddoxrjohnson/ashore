@@ -13,13 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 )
 
 // FileName is where the manifest lives in the repository.
@@ -166,33 +166,18 @@ func FromRepo(ctx context.Context, repo, sha, quarantine string, d Defaults) (m 
 func ReadRepo(ctx context.Context, repo, sha, quarantine string) (data []byte, found bool, err error) {
 	// ls-tree prints nothing for a path the commit lacks and exits 0, which
 	// cat-file does not; this is the only reliable "does it exist".
-	out, err := git(ctx, repo, quarantine, "ls-tree", sha, "--", FileName)
+	out, err := gitcmd.Output(ctx, repo, quarantine, "ls-tree", sha, "--", FileName)
 	if err != nil {
 		return nil, false, err
 	}
 	if len(bytes.TrimSpace(out)) == 0 {
 		return nil, false, nil
 	}
-	data, err = git(ctx, repo, quarantine, "cat-file", "blob", sha+":"+FileName)
+	data, err = gitcmd.Output(ctx, repo, quarantine, "cat-file", "blob", sha+":"+FileName)
 	if err != nil {
 		return nil, false, err
 	}
 	return data, true, nil
-}
-
-func git(ctx context.Context, repo, quarantine string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + repo}, args...)...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LC_ALL=C"}
-	if quarantine != "" {
-		cmd.Env = append(cmd.Env, "GIT_ALTERNATE_OBJECT_DIRECTORIES="+quarantine)
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr.Bytes()))
-	}
-	return out, nil
 }
 
 // Duration is a time.Duration written as "30s" in TOML and JSON.

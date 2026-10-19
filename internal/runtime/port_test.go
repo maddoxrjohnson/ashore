@@ -42,3 +42,22 @@ func TestFreePortSkipsPortsInUse(t *testing.T) {
 		}
 	}
 }
+
+func TestSpecValidateAndLabels(t *testing.T) {
+	s := Spec{App: "a", Release: "v1", HostPort: 4000, ContainerPort: 8080, Labels: map[string]string{"x": "1", LabelApp: "hidden"}}
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []Spec{{HostPort: 0, ContainerPort: 1}, {HostPort: 70000, ContainerPort: 1}, {HostPort: 1, ContainerPort: 0}} {
+		if bad.Validate() == nil {
+			t.Errorf("%+v should be invalid", bad)
+		}
+	}
+	l := s.AllLabels()
+	if l["x"] != "1" || l[LabelApp] != "a" || l[LabelRelease] != "v1" || len(l) != 3 {
+		t.Fatalf("labels %v", l)
+	}
+	if Short("0123456789abcdef") != "0123456789ab" || Short("ab") != "ab" {
+		t.Error("Short")
+	}
+}

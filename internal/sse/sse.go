@@ -5,20 +5,37 @@
 package sse
 
 import (
-	"bytes"
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/maddoxrjohnson/ashore/internal/lines"
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 )
 
-// Event names every stream ends with: exactly one Done or Error frame.
-// Lines of progress are unnamed ("message") events.
+// Event names. Every stream ends with exactly one Done or Error frame;
+// lines of deploy progress are unnamed ("message") events; a log stream
+// carries one EventLine per logs.Line, as JSON.
 const (
 	EventDone  = "done"
 	EventError = "error"
+	EventLine  = "line"
 )
+
+// keepalive is how often a quiet follow stream sends a comment, so a
+// proxy or a client with an idle timeout keeps the connection.
+const keepalive = 30 * time.Second
+
+// ErrNoVerdict reports a stream that ended without a done or error event:
+// the connection dropped, or the daemon went away mid-operation.
+var ErrNoVerdict = errors.New("stream ended without a result")
 
 // Writer frames events onto a response. It is an io.Writer so a deploy can
 // write to it directly: complete lines become events, a partial line waits
@@ -27,8 +44,8 @@ type Writer struct {
 	w  http.ResponseWriter
 	rc *http.ResponseController
 
-	mu  sync.Mutex
-	buf []byte
+	mu    sync.Mutex
+	lines lines.Writer
 }
 
 // New sends the headers and the first flush, so the client knows the
@@ -39,6 +56,7 @@ func New(w http.ResponseWriter) (*Writer, error) {
 	h.Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	st := &Writer{w: w, rc: http.NewResponseController(w)}
+	st.lines.Emit = func(line string) error { st.event("", line); return nil }
 	if err := st.rc.Flush(); err != nil {
 		return nil, fmt.Errorf("event stream: %w", err)
 	}
@@ -49,15 +67,7 @@ func New(w http.ResponseWriter) (*Writer, error) {
 func (st *Writer) Write(p []byte) (int, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.buf = append(st.buf, p...)
-	for {
-		i := bytes.IndexByte(st.buf, '\n')
-		if i < 0 {
-			return len(p), nil
-		}
-		st.event("", string(bytes.TrimRight(st.buf[:i], "\r")))
-		st.buf = st.buf[i+1:]
-	}
+	return st.lines.Write(p)
 }
 
 // Line sends one line of output as an unnamed event.
@@ -109,11 +119,73 @@ func (st *Writer) Fail(err error) {
 	st.event(EventError, err.Error())
 }
 
-func (st *Writer) flushPartial() {
-	if len(st.buf) > 0 {
-		st.event("", string(bytes.TrimRight(st.buf, "\r")))
-		st.buf = nil
+func (st *Writer) flushPartial() { _ = st.lines.Flush() }
+
+// Follow sends every line from ch as an EventLine until the channel
+// closes (the app was destroyed; the stream ends with Done) or ctx ends
+// (the client went away). A quiet stream gets a keepalive comment.
+func Follow(ctx context.Context, st *Writer, ch <-chan logs.Line) {
+	tick := time.NewTicker(keepalive)
+	defer tick.Stop()
+	for {
+		select {
+		case l, ok := <-ch:
+			if !ok {
+				st.Done()
+				return
+			}
+			st.JSON(EventLine, l)
+		case <-tick.C:
+			st.Comment("keepalive")
+		case <-ctx.Done():
+			return
+		}
 	}
+}
+
+// Read parses a stream and calls fn for each event that is neither Done
+// nor Error; those end the read. An Error event is returned as an error;
+// a stream that ends without either is ErrNoVerdict. Comments are skipped.
+func Read(r io.Reader, fn func(event, data string) error) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	var event string
+	var data []string
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case line == "":
+			if len(data) == 0 && event == "" {
+				continue // a comment's blank line
+			}
+			text := strings.Join(data, "\n")
+			switch event {
+			case EventDone:
+				return nil
+			case EventError:
+				return errors.New(text)
+			default:
+				if len(data) > 0 {
+					if err := fn(event, text); err != nil {
+						return err
+					}
+				}
+			}
+			event, data = "", nil
+		case strings.HasPrefix(line, ":"):
+			// a comment, such as a keepalive
+		case strings.HasPrefix(line, "event: "):
+			event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data = append(data, strings.TrimPrefix(line, "data: "))
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, "")
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return ErrNoVerdict
 }
 
 // event writes one frame and flushes it. Multi-line data is sent as one

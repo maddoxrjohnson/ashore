@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/sse"
@@ -14,12 +13,6 @@ const (
 	// says otherwise; MaxTail is the most it can ask for, the ring's size.
 	DefaultTail = 100
 	MaxTail     = logs.RingSize
-
-	// eventLine carries one JSON-encoded logs.Line.
-	eventLine = "line"
-	// keepalive is how often a quiet follow stream sends a comment, so a
-	// proxy or a client with an idle timeout keeps the connection.
-	keepalive = 30 * time.Second
 )
 
 // appLogs answers GET /api/v1/apps/{app}/logs?tail=N&follow=1 as an event
@@ -55,27 +48,12 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if !follow {
 		for _, l := range s.logs.Tail(app.Name, tail) {
-			st.JSON(eventLine, l)
+			st.JSON(sse.EventLine, l)
 		}
 		st.Done()
 		return
 	}
 	ch, cancel := s.logs.Subscribe(app.Name, tail)
 	defer cancel()
-	tick := time.NewTicker(keepalive)
-	defer tick.Stop()
-	for {
-		select {
-		case l, ok := <-ch:
-			if !ok { // the app was destroyed
-				st.Done()
-				return
-			}
-			st.JSON(eventLine, l)
-		case <-tick.C:
-			st.Comment("keepalive")
-		case <-r.Context().Done():
-			return
-		}
-	}
+	sse.Follow(r.Context(), st, ch)
 }

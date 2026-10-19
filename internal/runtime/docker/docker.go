@@ -84,7 +84,7 @@ func (r *Runtime) Start(ctx context.Context, s runtime.Spec) (runtime.Instance, 
 		Config: &container.Config{
 			Image:        s.Image,
 			Env:          environ(s.Env, s.ContainerPort),
-			Labels:       labels,
+			Labels:       s.AllLabels(),
 			ExposedPorts: network.PortSet{port: {}},
 		},
 		HostConfig: &container.HostConfig{
@@ -147,11 +147,11 @@ func (r *Runtime) Stop(ctx context.Context, id string, grace time.Duration) erro
 	secs := int((grace + time.Second - 1) / time.Second)
 	_, err := r.docker.ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: &secs})
 	if err != nil && !cerrdefs.IsNotFound(err) {
-		return fmt.Errorf("stop %s: %w", short(id), err)
+		return fmt.Errorf("stop %s: %w", runtime.Short(id), err)
 	}
 	_, err = r.docker.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true})
 	if err != nil && !cerrdefs.IsNotFound(err) {
-		return fmt.Errorf("remove %s: %w", short(id), err)
+		return fmt.Errorf("remove %s: %w", runtime.Short(id), err)
 	}
 	return nil
 }
@@ -164,11 +164,11 @@ func (r *Runtime) Wait(ctx context.Context, id string) (int, error) {
 	select {
 	case w := <-res.Result:
 		if w.Error != nil && w.Error.Message != "" {
-			return -1, fmt.Errorf("wait %s: %s", short(id), w.Error.Message)
+			return -1, fmt.Errorf("wait %s: %s", runtime.Short(id), w.Error.Message)
 		}
 		return int(w.StatusCode), nil
 	case err := <-res.Error:
-		return -1, fmt.Errorf("wait %s: %w", short(id), notFound(err))
+		return -1, fmt.Errorf("wait %s: %w", runtime.Short(id), notFound(err))
 	case <-ctx.Done():
 		return -1, ctx.Err()
 	}
@@ -184,14 +184,14 @@ func (r *Runtime) Logs(ctx context.Context, id string, since time.Time, stdout, 
 	}
 	rc, err := r.docker.ContainerLogs(ctx, id, opts)
 	if err != nil {
-		return fmt.Errorf("logs %s: %w", short(id), notFound(err))
+		return fmt.Errorf("logs %s: %w", runtime.Short(id), notFound(err))
 	}
 	defer func() { _ = rc.Close() }()
 	if _, err := stdcopy.StdCopy(stdout, stderr, rc); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("logs %s: %w", short(id), err)
+		return fmt.Errorf("logs %s: %w", runtime.Short(id), err)
 	}
 	return nil
 }
@@ -234,11 +234,4 @@ func notFound(err error) error {
 		return runtime.ErrNotFound
 	}
 	return err
-}
-
-func short(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }

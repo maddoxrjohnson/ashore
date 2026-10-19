@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maddoxrjohnson/ashore/internal/lines"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 )
 
@@ -96,7 +97,7 @@ func (h *Hub) Sink(app string) *Sink {
 	if s, ok := h.apps[app]; ok {
 		return s
 	}
-	s := &Sink{app: app, dir: filepath.Join(h.dir, app), obs: h.Observer, ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
+	s := &Sink{app: app, dir: filepath.Join(h.dir, app), obs: h.Observer, log: h.log, ring: newRing(RingSize), subs: make(map[*subscriber]struct{})}
 	if !h.closed {
 		f, err := openRotating(filepath.Join(s.dir, "current.log"), h.RotateAt)
 		if err != nil {
@@ -126,15 +127,16 @@ func (h *Hub) Subscribe(app string, tail int) (<-chan Line, func()) {
 // from here (an instance adopted after a daemon restart).
 func (h *Hub) Collect(ctx context.Context, inst runtime.Instance, since time.Time) error {
 	sink := h.Sink(inst.App)
-	stamp := func(stream string) *splitter {
-		return newSplitter(func(text string) {
+	stamp := func(stream string) *lines.Writer {
+		return &lines.Writer{Max: MaxLine, Emit: func(text string) error {
 			sink.Append(Line{App: inst.App, Release: inst.Release, Instance: inst.ID, Stream: stream, Time: time.Now(), Text: text})
-		})
+			return nil
+		}}
 	}
 	out, errs := stamp(StreamStdout), stamp(StreamStderr)
 	err := h.rt.Logs(ctx, inst.ID, since, out, errs)
-	out.Flush()
-	errs.Flush()
+	_ = out.Flush()
+	_ = errs.Flush()
 	if err != nil && ctx.Err() == nil {
 		h.log.Warn("log collector ended", "app", inst.App, "instance", inst.ID, "err", err)
 	}
@@ -184,6 +186,7 @@ type Sink struct {
 	app string
 	dir string
 	obs Observer
+	log *slog.Logger
 
 	mu     sync.Mutex
 	file   *rotatingFile // nil when the file could not be opened
@@ -202,7 +205,7 @@ func (s *Sink) Append(l Line) {
 	}
 	if s.file != nil {
 		if err := s.file.WriteLine(l); err != nil {
-			slog.Warn("write log file", "app", s.app, "err", err)
+			s.log.Warn("write log file", "app", s.app, "err", err)
 		}
 	}
 	s.ring.push(l)

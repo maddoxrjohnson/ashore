@@ -2,7 +2,6 @@ package hook
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -19,7 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maddoxrjohnson/ashore/internal/gitcmd"
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
+	"github.com/maddoxrjohnson/ashore/internal/lines"
+	"github.com/maddoxrjohnson/ashore/internal/serve"
 )
 
 // Deployer is what the daemon does with a push the hook has handed over.
@@ -137,28 +139,7 @@ func (s *Server) Listen() (net.Listener, error) {
 // (which removes the socket file) and waits for the deploys in progress,
 // which see the cancelled context.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	defer cancel()
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("hook accept: %w", err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handle(ctx, c)
-		}()
-	}
+	return serve.Accept(ctx, ln, "hook", s.handle)
 }
 
 // handle serves one hook: read the request, check it, run the deploy with
@@ -194,7 +175,7 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 
 	start := time.Now()
 	slog.Info("hook connected", "app", req.App, "sha", req.SHA)
-	lw := &lineWriter{w: c}
+	lw := newLineWriter(c)
 	err = s.deployer.Deploy(ctx, req.App, req.SHA, req.Quarantine, lw)
 	_ = lw.Flush()
 	if err != nil {
@@ -245,7 +226,7 @@ func (s *Server) check(req *Request) error {
 	if !s.redeem(req.Nonce, req.App) {
 		return errors.New("bad or expired nonce")
 	}
-	if !isObjectName(req.SHA) {
+	if !gitcmd.IsObjectName(req.SHA) {
 		return fmt.Errorf("bad object name %q", req.SHA)
 	}
 	if req.Quarantine == "" || !filepath.IsAbs(req.Quarantine) {
@@ -266,39 +247,24 @@ func (s *Server) check(req *Request) error {
 // Flush sends what is left as a line of its own. Safe for concurrent use,
 // since a deploy may write from more than one goroutine.
 type lineWriter struct {
-	w   io.Writer
-	mu  sync.Mutex
-	buf []byte
+	mu    sync.Mutex
+	lines lines.Writer
+}
+
+func newLineWriter(w io.Writer) *lineWriter {
+	lw := &lineWriter{}
+	lw.lines = lines.Writer{Max: maxLine, Emit: func(line string) error { return writeLine(w, bandOutput, line) }}
+	return lw
 }
 
 func (l *lineWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.buf = append(l.buf, p...)
-	for {
-		i := bytes.IndexByte(l.buf, '\n')
-		n := i + 1 // consumed: the line and its newline
-		if i < 0 {
-			if len(l.buf) < maxLine {
-				return len(p), nil
-			}
-			i, n = maxLine, maxLine // no newline in sight: send a chunk as a line
-		}
-		line := bytes.TrimSuffix(l.buf[:i], []byte{'\r'})
-		if err := writeLine(l.w, bandOutput, string(line)); err != nil {
-			return 0, err
-		}
-		l.buf = l.buf[n:]
-	}
+	return l.lines.Write(p)
 }
 
 func (l *lineWriter) Flush() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.buf) == 0 {
-		return nil
-	}
-	line := string(bytes.TrimSuffix(l.buf, []byte{'\r'}))
-	l.buf = nil
-	return writeLine(l.w, bandOutput, line)
+	return l.lines.Flush()
 }
