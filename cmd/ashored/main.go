@@ -22,6 +22,7 @@ import (
 	"github.com/maddoxrjohnson/ashore/internal/config"
 	"github.com/maddoxrjohnson/ashore/internal/gitserver"
 	"github.com/maddoxrjohnson/ashore/internal/hook"
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/router"
 	dockerrt "github.com/maddoxrjohnson/ashore/internal/runtime/docker"
 	"github.com/maddoxrjohnson/ashore/internal/store"
@@ -85,7 +86,10 @@ func run() error {
 	defer func() { _ = docker.Close() }()
 
 	rt := router.New(slog.Default())
-	sup := supervisor.New(st, builder.New(docker, cfg.DataDir, cfg.BuildTimeout), dockerrt.New(docker), rt,
+	drt := dockerrt.New(docker)
+	hub := logs.New(cfg.DataDir, drt, slog.Default())
+	defer func() { _ = hub.Close() }()
+	sup := supervisor.New(st, builder.New(docker, cfg.DataDir, cfg.BuildTimeout), drt, rt, hub,
 		supervisor.Config{
 			DataDir:          cfg.DataDir,
 			Domain:           cfg.Domain,

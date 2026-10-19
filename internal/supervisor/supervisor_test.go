@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/maddoxrjohnson/ashore/internal/builder"
+	"github.com/maddoxrjohnson/ashore/internal/logs"
 	"github.com/maddoxrjohnson/ashore/internal/router"
 	"github.com/maddoxrjohnson/ashore/internal/runtime"
 	"github.com/maddoxrjohnson/ashore/internal/store"
@@ -258,6 +259,7 @@ type fixture struct {
 	builder *fakeBuilder
 	runtime *fakeRuntime
 	router  *router.Router
+	logs    *logs.Hub
 	clock   *fakeClock
 	cancel  context.CancelFunc
 	done    chan struct{}
@@ -284,7 +286,9 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	cfg.DataDir, cfg.Domain, cfg.HTTPPort = t.TempDir(), "localhost", 8080
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f := &fixture{store: st, builder: &fakeBuilder{}, runtime: newFakeRuntime(t), router: router.New(log), clock: newFakeClock(), done: make(chan struct{})}
-	f.sup = New(st, f.builder, f.runtime, f.router, cfg, log)
+	f.logs = logs.New(cfg.DataDir, f.runtime, log)
+	t.Cleanup(func() { _ = f.logs.Close() })
+	f.sup = New(st, f.builder, f.runtime, f.router, f.logs, cfg, log)
 	f.sup.clock = f.clock
 	// No repository exists here; a push sees no ashore.toml unless a test
 	// calls withManifest.
@@ -1494,5 +1498,71 @@ func TestAnswers(t *testing.T) {
 	srv.Close()
 	if ok, detail := answers(ctx, addr, "app.localhost", "/ok"); ok || detail == "" {
 		t.Errorf("closed server: %v %q", ok, detail)
+	}
+}
+
+// waitLines polls the app's sink until it holds n lines.
+func (f *fixture) waitLines(t *testing.T, app string, n int) []logs.Line {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := f.logs.Sink(app).Tail(100); len(got) >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink holds %d lines, want %d", len(f.logs.Sink(app).Tail(100)), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestInstanceOutputIsCollected(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.runtime.logs = "booting\nready\n"
+	if _, err := f.deploy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	lines := f.waitLines(t, "hello", 2)
+	if lines[0].Text != "booting" || lines[1].Text != "ready" {
+		t.Fatalf("lines: %+v", lines)
+	}
+	if lines[0].Release != "v1" || lines[0].Instance != "inst1" || lines[0].Stream != logs.StreamStdout {
+		t.Fatalf("stamp: %+v", lines[0])
+	}
+
+	// A subscriber ends when the app is destroyed.
+	ch, cancel := f.logs.Sink("hello").Subscribe(0)
+	defer cancel()
+	if err := f.sup.Destroy(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("got a line, want the channel closed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber not closed by destroy")
+	}
+}
+
+func TestAdoptedInstanceIsCollected(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.runtime.logs = "still here\n"
+	app, _ := f.store.GetApp(context.Background(), "hello")
+	rel, err := f.store.CreateRelease(context.Background(), app.ID, store.NewRelease{Image: "img", Note: "push"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.SetLive(context.Background(), app.ID, rel.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.runtime.found = []runtime.Instance{{ID: "old1", App: "hello", Release: "v1", Addr: "127.0.0.1:1", Running: true}}
+	if _, err := f.sup.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lines := f.waitLines(t, "hello", 1)
+	if lines[0].Text != "still here" || lines[0].Instance != "old1" {
+		t.Fatalf("lines: %+v", lines)
 	}
 }

@@ -60,6 +60,15 @@ type Router interface {
 	Remove(host string)
 }
 
+// Logs collects what instances print; *logs.Hub satisfies it. Collect is
+// run in a goroutine of its own for every instance the supervisor starts
+// or adopts, with the supervisor's lifetime as its context. A nil Logs
+// collects nothing.
+type Logs interface {
+	Collect(ctx context.Context, inst runtime.Instance, since time.Time) error
+	Forget(app string) error
+}
+
 // Config is what a deploy needs to know about its surroundings.
 type Config struct {
 	DataDir string
@@ -122,6 +131,7 @@ type Supervisor struct {
 	builder Builder
 	runtime runtime.Runtime
 	router  Router
+	logs    Logs
 	cfg     Config
 	log     *slog.Logger
 	builds  chan struct{} // the build semaphore
@@ -140,8 +150,8 @@ type Supervisor struct {
 	actors sync.WaitGroup
 }
 
-// New wires the supervisor. A nil logger means slog.Default.
-func New(st Store, b Builder, rt runtime.Runtime, r Router, cfg Config, log *slog.Logger) *Supervisor {
+// New wires the supervisor. lg may be nil; a nil logger means slog.Default.
+func New(st Store, b Builder, rt runtime.Runtime, r Router, lg Logs, cfg Config, log *slog.Logger) *Supervisor {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -149,7 +159,7 @@ func New(st Store, b Builder, rt runtime.Runtime, r Router, cfg Config, log *slo
 		cfg.BuildConcurrency = 1
 	}
 	sup := &Supervisor{
-		store: st, builder: b, runtime: rt, router: r, cfg: cfg, log: log,
+		store: st, builder: b, runtime: rt, router: r, logs: lg, cfg: cfg, log: log,
 		builds:       make(chan struct{}, cfg.BuildConcurrency),
 		apps:         make(map[string]*actor),
 		readManifest: manifest.ReadRepo,
@@ -409,6 +419,7 @@ func (a *actor) adopt(cmd deployCmd) error {
 	a.setStatus(StateRunning, "adopted at start")
 	s.actors.Add(1)
 	go a.watch(s.ctx, cmd.adopt.inst)
+	a.collect(cmd.adopt.inst, s.clock.Now()) // what it printed while no daemon listened is in Docker, not here
 	s.log.Info("instance adopted", "app", a.name, "id", cmd.adopt.inst.ID, "release", cmd.adopt.inst.Release, "addr", cmd.adopt.inst.Addr)
 	return nil
 }
@@ -429,7 +440,28 @@ func (a *actor) destroy(cmd deployCmd) error {
 	}
 	a.current = nil
 	a.setStatus(StateStopped, "destroyed")
+	if s.logs != nil {
+		if err := s.logs.Forget(a.name); err != nil {
+			s.log.Warn("forget logs", "app", a.name, "err", err)
+		}
+	}
 	return nil
+}
+
+// collect starts the instance's log collector. It runs from the moment the
+// instance exists, so the lines of a release that then fails its health
+// check are on record too; it ends when the instance exits or the
+// supervisor stops.
+func (a *actor) collect(inst runtime.Instance, since time.Time) {
+	s := a.sup
+	if s.logs == nil {
+		return
+	}
+	s.actors.Add(1)
+	go func() {
+		defer s.actors.Done()
+		_ = s.logs.Collect(s.ctx, inst, since)
+	}()
 }
 
 // forget drops an actor that has returned, so a later command for the same
@@ -798,6 +830,7 @@ func (a *actor) start(ctx context.Context, rel store.Release, env map[string]str
 		return runtime.Instance{}, err
 	}
 	s.log.Info("instance started", "app", a.name, "release", rel.Name(), "id", inst.ID, "addr", inst.Addr)
+	a.collect(inst, time.Time{})
 	if m.Health.Path == "" {
 		_, _ = fmt.Fprintf(out, "-----> waiting for %s to listen on port %d\n", rel.Name(), containerPort)
 	} else {

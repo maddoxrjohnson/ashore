@@ -27,7 +27,9 @@ exits on its own is restarted with exponential backoff (1, 2, 4, up to 60 second
 given up on after ten failures in ten minutes, which `ps` reports. The `ashore` command
 talks to the daemon's API: apps, config, releases, rollback, restart, `ps`, keys. A daemon
 restart changes nothing for the apps: containers keep serving while it is down, and on start
-it reconciles what is running with what should be before it opens a single port.
+it reconciles what is running with what should be before it opens a single port. Every
+line an instance prints is collected once, stamped, appended to a per-app log file, and
+kept in memory for the readers that `logs -f` and the dashboard add next.
 
 ## Zero-downtime deploys, measured
 
@@ -134,6 +136,18 @@ never exposed on the router's port; from another machine, reach it through an SS
 The build context is `git archive` of the pushed commit, so only tracked files reach the
 build and `.dockerignore` has no effect. To keep tracked files out of the image, mark them
 `export-ignore` in `.gitattributes`.
+
+## Logs
+
+A collector goroutine per instance reads the container's output from the moment it
+starts, splits it into lines at newlines (chunks from Docker end wherever the read did,
+so a partial line waits for the rest), stamps each with the app, release, instance, stream,
+and the time it arrived, and appends it to `data/logs/<app>/current.log` (rotated at
+50 MB, five kept) and to a ring of the app's last 1000 lines in memory. Lines printed while
+a release was still failing its health check are on record too. Readers subscribe to the
+ring: each gets a bounded channel, sends to it never block, and a reader that falls behind
+loses lines and is then handed one line saying how many, so a stalled tab can never slow
+the app or the collector.
 
 ## Daemon restarts
 
